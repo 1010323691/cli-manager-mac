@@ -266,6 +266,7 @@ struct Management: View {
                     .frame(width: 148)
                     .accessibilityLabel("工作区视图")
                     .accessibilityIdentifier("workspace-source")
+                    .measureFixture("workspace-source")
                 }
                 if !showsManaged {
                     directoryControl(instance, directory: directory, active: active)
@@ -323,7 +324,8 @@ struct Management: View {
             .measureFixture("toolbar")
             VStack(spacing: 0) {
                 if showsManaged {
-                    ManagedActivityPane(model: model, attempts: managed)
+                    ManagedActivityPane(model: model, attempts: managed,
+                                        snapshotUnavailable: model.snapshotError != nil)
                         .id(instance.terminalKey)
                 } else if let session, active {
                     DockedTerminal(session: session)

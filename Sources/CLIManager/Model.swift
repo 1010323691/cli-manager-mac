@@ -354,12 +354,17 @@ final class Dashboard: ObservableObject {
     var instances: [InstanceRecord] { snapshot?.instances ?? [] }
     var tasks: [TaskRecord] { snapshot?.tasks ?? [] }
     var selected: InstanceRecord? { instances.first { $0.id == selection } }
-    var liveAttempts: [LiveAttempt] {
-        guard snapshotError == nil else { return [] }
-        return LiveAttempt.normalized(snapshot?.liveAttempts ?? [])
+    private var lastKnownAttempts: [LiveAttempt] {
+        LiveAttempt.normalized(snapshot?.liveAttempts ?? [])
     }
+
+    var liveAttempts: [LiveAttempt] {
+        snapshotError == nil ? lastKnownAttempts : []
+    }
+
     func managedAttempts(for instance: InstanceRecord) -> [LiveAttempt] {
-        liveAttempts.filter { $0.instance == instance.id }
+        // A failed refresh cannot implicitly switch a read-only workspace to a PTY.
+        lastKnownAttempts.filter { $0.instance == instance.id }
     }
 
     func managedOutput(for attempt: LiveAttempt) async throws -> ManagedOutput {

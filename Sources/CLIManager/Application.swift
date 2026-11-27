@@ -419,6 +419,33 @@ private final class ApplicationController: NSObject, NSApplicationDelegate {
               FileManager.default.fileExists(atPath: state.appendingPathComponent("coexist-ended-served").path) else {
             throw VisualEvidence.failure("Managed output used the manual terminal or missed the resumed attempt")
         }
+
+        let snapshotFailure = state.appendingPathComponent("coexist-snapshot-unavailable")
+        try Data().write(to: snapshotFailure)
+        await dashboard.refresh()
+        try await waitForFixture("read-only state error") {
+            VisualEvidence.frames["managed-snapshot-unavailable"] != nil
+        }
+        try await VisualEvidence.settle()
+        guard dashboard.snapshotError != nil, dashboard.liveAttempts.isEmpty,
+              VisualEvidence.frames["workspace-source"] != nil,
+              session.phase.isActive, session.terminal.window == nil,
+              window.firstResponder !== session.terminal,
+              session.terminal.process.shellPid == originalPID else {
+            throw VisualEvidence.failure("Snapshot failure switched the workspace or delivered focus to the manual terminal")
+        }
+        VisualEvidence.frames.removeValue(forKey: "managed-output")
+        try FileManager.default.removeItem(at: snapshotFailure)
+        await dashboard.refresh()
+        try await waitForFixture("same managed output after snapshot recovery") {
+            self.dashboard.snapshotError == nil &&
+            self.dashboard.liveAttempts.first(where: { $0.instance == session.instanceID })?.attemptID == "managed-attempt" &&
+            VisualEvidence.frames["managed-output"] != nil
+        }
+        guard session.terminal.window == nil, window.firstResponder !== session.terminal else {
+            throw VisualEvidence.failure("Recovering the snapshot gave focus to the manual terminal")
+        }
+
         dashboard.presentManualTerminal(session)
         try await waitForFixture("reattached manual terminal") { session.terminal.window === window }
         guard session.terminal.process.shellPid == originalPID else {

@@ -20,6 +20,9 @@ marker = state / "coexist-ended-once"
 if sys.argv[1:4] == ["managed-output", "managed-fixture", "managed-attempt"] and marker.exists():
     marker.rename(state / "coexist-ended-served")
     print(json.dumps({{"schema": 1, "attempt_id": "managed-attempt", "state": "ended", "entries": []}}))
+elif sys.argv[1:] == ["snapshot"] and (state / "coexist-snapshot-unavailable").exists():
+    print(json.dumps({{"error": "Injected snapshot read failure"}}))
+    sys.exit(2)
 else:
     os.execv(sys.executable, [sys.executable, "-I", "-B", {str(entry)!r}, *sys.argv[1:]])
 """)

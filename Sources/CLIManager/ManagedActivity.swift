@@ -22,6 +22,7 @@ struct ManagedOutput: Decodable, Equatable, Sendable {
 struct ManagedActivityPane: View {
     let model: Dashboard
     let attempts: [LiveAttempt]
+    let snapshotUnavailable: Bool
     @State private var selection: String?
     @State private var output: ManagedOutput?
     @State private var failedAttempt: String?
@@ -46,14 +47,25 @@ struct ManagedActivityPane: View {
                             .lineLimit(1)
                     }
                     Spacer()
-                    StateBadge(data: attempt.badge)
+                    StateBadge(data: snapshotUnavailable
+                               ? BadgeData("状态待核实", "questionmark.circle", .secondary)
+                               : attempt.badge)
                 }
                 .padding(.horizontal, 14)
                 .frame(height: 39)
                 .overlay(alignment: .bottom) {
                     Rectangle().fill(WorkspacePalette.color(WorkspacePalette.rule)).frame(height: 1)
                 }
-                outputView(attempt)
+                if snapshotUnavailable {
+                    Label("本地状态读取失败，等待恢复", systemImage: "exclamationmark.circle")
+                        .font(.subheadline)
+                        .foregroundStyle(WorkspacePalette.color(WorkspacePalette.muted))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityIdentifier("managed-snapshot-unavailable")
+                        .measureFixture("managed-snapshot-unavailable")
+                } else {
+                    outputView(attempt)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .foregroundStyle(WorkspacePalette.color(WorkspacePalette.ink))
