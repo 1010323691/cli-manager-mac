@@ -7,8 +7,10 @@ configuration="${CONFIGURATION:-release}"
 build_output="$project/.build"
 if [[ "$configuration" == debug ]]; then build_output="$build_output/DebugApp"; fi
 output="$build_output/CLI Manager.app"
+publication=replace
 if [[ -n "${CLI_MANAGER_APP_OUTPUT:-}" ]]; then
     output="$CLI_MANAGER_APP_OUTPUT"
+    publication=exclusive
     [[ "$output" == /*.app && ! -e "$output" && ! -L "$output" ]] || {
         printf 'Alternate .app output must be an absent absolute path.\n' >&2
         exit 1
@@ -39,8 +41,8 @@ scratch="${CLI_MANAGER_BUILD_SCRATCH:-$project/.build/native-terminal-check}"
 swift_build=(/usr/bin/swift build --build-system native --scratch-path "$scratch" --package-path "$project" --configuration "$configuration")
 "${swift_build[@]}" >&2
 binary_dir="$("${swift_build[@]}" --show-bin-path)"
-mkdir -p "$project/.build"
-stage="$(mktemp -d "$project/.build/bundle.XXXXXXXX")"
+mkdir -p "$build_output"
+stage="$(mktemp -d "$build_output/.cli-manager-bundle.XXXXXXXX")"
 trap 'rm -rf "$stage"' EXIT
 bundle="$stage/CLI Manager.app"
 resources="$bundle/Contents/Resources"
@@ -63,11 +65,5 @@ done
 /usr/bin/plutil -lint "$bundle/Contents/Info.plist" >&2
 /usr/bin/codesign --force --sign - "$bundle" >&2
 /usr/bin/codesign --verify --strict "$bundle"
-mkdir -p "$build_output"
-# Replace only the generated bundle inside this project's ignored build directory.
-if [[ -e "$output" ]]; then mv "$output" "$stage/previous.app"; fi
-if ! mv "$bundle" "$output"; then
-    if [[ -e "$stage/previous.app" ]]; then mv "$stage/previous.app" "$output"; fi
-    exit 1
-fi
+/usr/bin/swift "$project/scripts/publish-app.swift" "$publication" "$bundle" "$output"
 printf '%s\n' "$output"

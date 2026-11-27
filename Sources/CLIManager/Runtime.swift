@@ -207,6 +207,7 @@ struct Runtime: Sendable {
 
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         var data = Data()
+        var childExited = false
         var buffer = [UInt8](repeating: 0, count: 16_384)
         while ProcessInfo.processInfo.systemUptime < deadline {
             let count = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
@@ -217,12 +218,18 @@ struct Runtime: Sendable {
                 data.append(contentsOf: buffer.prefix(count))
                 continue
             }
-            if count < 0, errno != EAGAIN, errno != EWOULDBLOCK, errno != EINTR {
-                throw CLIError.command("读取 CLI 输出失败。")
+            if count < 0 {
+                if errno == EINTR { continue }
+                guard errno == EAGAIN || errno == EWOULDBLOCK else {
+                    throw CLIError.command("读取 CLI 输出失败。")
+                }
             }
-            // A descendant can keep the pipe open after the command has exited.
+            // After observing exit, drain bytes written between the last read
+            // and the exit check. A descendant may still hold the write end.
+            if childExited { return Result(status: process.terminationStatus, data: data) }
             if !process.isRunning {
-                return Result(status: process.terminationStatus, data: data)
+                childExited = true
+                continue
             }
             usleep(10_000)
         }

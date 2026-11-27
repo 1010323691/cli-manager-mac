@@ -159,7 +159,7 @@ struct Quota: Decodable, Sendable {
     let blockedAt: Double?
     let cooldownUntil: Double?
     let limitResetAt: Double?
-    let nextResetAt: Double?
+    let resetEvents: [QuotaResetEvent]?
     let windows: [QuotaWindow]
     let unverifiedWindows: [QuotaWindow]?
 
@@ -174,7 +174,7 @@ struct Quota: Decodable, Sendable {
         case blockedAt = "blocked_at"
         case cooldownUntil = "cooldown_until"
         case limitResetAt = "limit_reset_at"
-        case nextResetAt = "next_reset_at"
+        case resetEvents = "reset_events"
     }
 
     var label: String {
@@ -320,7 +320,7 @@ final class Dashboard: ObservableObject {
     private var startupQuotaGroups: Set<String>?
     private var quotaInFlight: Set<String> = []
     private var autoQuotaTask: Task<Void, Never>?
-    private var resetRetries: [String: QuotaResetRetry] = [:]
+    private var resetRetries: [String: QuotaResetRetries] = [:]
     @Published private var probeFailures: [String: ProbeFailure] = [:]
 
     static let providerQueryProgress = "正在查询提供方"
@@ -489,6 +489,14 @@ final class Dashboard: ObservableObject {
         if startupQuotaGroups == nil { startupQuotaGroups = accounts }
         else { startupQuotaGroups?.formIntersection(accounts) }
         quotaTriggers.observe(Dictionary(uniqueKeysWithValues: records.map { ($0.guardToken, $0.quotaUsage ?? .empty) }))
+        for group in Array(resetRetries.keys) {
+            if accounts.contains(group) {
+                let events = Set(records.filter { $0.quotaGroup == group }.flatMap { $0.quota.resetEvents ?? [] })
+                resetRetries[group]?.retain(events)
+            } else {
+                resetRetries.removeValue(forKey: group)
+            }
+        }
     }
 
     private func quotaEligible(_ instance: InstanceRecord) -> Bool {
@@ -508,15 +516,16 @@ final class Dashboard: ObservableObject {
             return lhs.id < rhs.id
         }
         func isDue(_ instance: InstanceRecord) -> Bool {
-            guard let group = instance.quotaGroup, let reset = instance.quota.nextResetAt, reset <= now else { return false }
-            return resetRetries[group]?.allows(reset, now: now) ?? true
+            guard let group = instance.quotaGroup else { return false }
+            let retries = resetRetries[group] ?? QuotaResetRetries()
+            return instance.quota.resetEvents?.contains { retries.allows($0, now: now) } == true
         }
         let target = eligible.first { quotaTriggers.pending[$0.guardToken] != nil }
             ?? eligible.first { $0.quotaGroup.map { startupQuotaGroups?.contains($0) == true } == true }
             ?? eligible.first(where: isDue)
         guard let target, let group = target.quotaGroup else { return }
         let event = quotaTriggers.pending[target.guardToken]
-        let reset = isDue(target) ? target.quota.nextResetAt : nil
+        let resets = (target.quota.resetEvents ?? []).filter { $0.resetsAt <= now }
         autoQuotaTask = Task { [weak self] in
             guard let self else { return }
             let result = await queryQuota(target, announce: false)
@@ -526,9 +535,8 @@ final class Dashboard: ObservableObject {
             guard result != .skipped else { return }
             startupQuotaGroups?.remove(group)
             if let event { quotaTriggers.complete(target.guardToken, through: event) }
-            if let reset {
-                resetRetries[group] = QuotaResetRetry(reset: reset, previous: resetRetries[group],
-                                                       now: Date.now.timeIntervalSince1970)
+            if !resets.isEmpty {
+                resetRetries[group, default: QuotaResetRetries()].record(resets, now: Date.now.timeIntervalSince1970)
             }
             if !Task.isCancelled { scheduleAutomaticQuotas() }
         }

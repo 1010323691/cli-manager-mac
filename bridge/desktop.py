@@ -272,7 +272,7 @@ def quota_view(status, cooldown_until, signals, now, used_at):
         used_since = not confirmed_limit and used_at is not None and used_at > stamp
         stale = "reset" if reset_due else "usage" if used_since else None
         if used > 0 and reset is not None:
-            resets.append(reset)
+            resets.append({"bucket": bucket, "window": window, "resets_at": reset})
         windows.append({"bucket": bucket, "window": window, "remaining_percent": 100 - used,
                         "observed_at": stamp, "resets_at": reset, "minutes": number(value.get("minutes")),
                         "expired": stale is not None, "refresh_reason": stale})
@@ -293,7 +293,8 @@ def quota_view(status, cooldown_until, signals, now, used_at):
     return {"state": state, "windows": windows, "remaining_percent": min(live, default=None),
             "observed_at": max((row["observed_at"] for row in windows), default=None),
             "checked_at": number(sample.get("checked_at")), "blocked_at": blocked_at,
-            "cooldown_until": cooldown_until, "next_reset_at": min(resets, default=None),
+            "cooldown_until": cooldown_until, "reset_events": resets,
+            "next_reset_at": min((event["resets_at"] for event in resets), default=None),
             "limit_reset_at": reset if reset and blocked_at is None and all(full_resets) else None}
 
 
@@ -387,6 +388,7 @@ def snapshot():
             if prior["state"] == "limited":
                 display_quota = {**prior, "remaining_percent": None, "windows": confirmed}
             display_quota["next_reset_at"] = prior["next_reset_at"]
+            display_quota["reset_events"] = prior["reset_events"]
             display_quota["unverified_windows"] = [
                 {**row, "remaining_percent": None} for row in prior["windows"] if row not in confirmed
             ]
@@ -525,6 +527,14 @@ def refresh_terminal_quota(instance, expected):
         pass
 
 
+def contains_directory(ancestor, descendant):
+    reference = ancestor.stat()
+    for path in (descendant, *descendant.parents):
+        if os.path.samestat(reference, path.stat()):
+            return True
+    return False
+
+
 def run_terminal(args):
     if not all(os.isatty(fd) for fd in (0, 1, 2)) or os.tcgetpgrp(0) != os.getpgrp():
         raise DelegateError("用户终端需要前台交互式 PTY")
@@ -537,7 +547,7 @@ def run_terminal(args):
     root = state_root()
     if not directory.is_dir():
         raise DelegateError("所选工作目录不是目录")
-    if directory.is_relative_to(root) or root.is_relative_to(directory):
+    if contains_directory(root, directory) or contains_directory(directory, root):
         raise DelegateError("工作目录不能与 CLI Manager 的状态目录重叠")
 
     store = SnapshotStore(root)

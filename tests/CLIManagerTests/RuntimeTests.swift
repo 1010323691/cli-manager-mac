@@ -13,6 +13,16 @@ final class RuntimeTests: XCTestCase {
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 2)
     }
 
+    func testCollectsTrailingOutputFromExitingChild() throws {
+        for _ in 0..<20 {
+            let result = try Runtime.execute(URL(fileURLWithPath: "/bin/sh"),
+                                             ["-c", "printf '{\"state\":'; printf '\"ready\"}'"],
+                                             environment: ProcessInfo.processInfo.environment, timeout: 2)
+            XCTAssertEqual(result.status, 0)
+            XCTAssertEqual(String(data: result.data, encoding: .utf8), #"{"state":"ready"}"#)
+        }
+    }
+
     func testTimeoutTerminatesChild() {
         let start = ProcessInfo.processInfo.systemUptime
         XCTAssertThrowsError(try Runtime.execute(URL(fileURLWithPath: "/bin/sleep"), ["10"],

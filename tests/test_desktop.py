@@ -198,6 +198,31 @@ class DesktopTest(unittest.TestCase):
             store.put("tasks", {**task, "state": state})
             self.assertEqual([row["task_id"] for row in self.bridge("snapshot")["live_attempts"]], ["stopping"])
 
+    def test_directory_overlap_uses_filesystem_identity(self):
+        parent = self.root / "Workspace"
+        state = parent / "State"
+        nested = state / "Child"
+        nested.mkdir(parents=True)
+        alias = self.root / "workspace"
+        if not alias.exists():
+            self.skipTest("requires a case-insensitive filesystem")
+        self.assertTrue(desktop.contains_directory(state, alias / "STATE"))
+        self.assertTrue(desktop.contains_directory(state, alias / "STATE" / "child"))
+        self.assertTrue(desktop.contains_directory(alias, state))
+        self.assertFalse(desktop.contains_directory(nested, alias))
+
+    def test_quota_projects_each_used_window_reset(self):
+        signals = [
+            ("window", 1, {"bucket": "codex", "window": "primary", "used": 50, "resets_at": 100}),
+            ("window", 1, {"bucket": "codex", "window": "secondary", "used": 20, "resets_at": 200}),
+            ("window", 1, {"bucket": "claude", "window": "week", "used": 0, "resets_at": 300}),
+        ]
+        quota = desktop.quota_view({}, None, signals, 110, None)
+        self.assertEqual(quota["reset_events"], [
+            {"bucket": "codex", "window": "primary", "resets_at": 100},
+            {"bucket": "codex", "window": "secondary", "resets_at": 200},
+        ])
+
     def test_quota_follows_usage_and_reset_without_inheriting_dispatch_ttl(self):
         self.install_instance()
         self.instance_command("login", terminal=True)

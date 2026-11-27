@@ -103,3 +103,12 @@ class InstallerTest(unittest.TestCase):
             self.assertEqual(list(root.iterdir()), [])
         self.assertEqual(list(claude.iterdir()), [target])
         self.assertEqual((target / "other").read_text(), "unrelated")
+
+    def test_alias_with_newline_target_cannot_serialize_app_path(self):
+        target = self.apps.with_name("Applications with\nnewline")
+        target.mkdir()
+        self.apps.symlink_to(target, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            self.run_install()
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertFalse(self.skills.exists())

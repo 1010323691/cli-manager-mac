@@ -62,14 +62,23 @@ final class ActivityAndQuotaTests: XCTestCase {
         XCTAssertTrue(lifecycle.pending.isEmpty)
     }
 
-    func testResetRetryBacksOffAndANewWindowBypassesOldBackoff() {
-        let first = QuotaResetRetry(reset: 100, previous: nil, now: 101)
-        XCTAssertFalse(first.allows(100, now: 160))
-        XCTAssertTrue(first.allows(100, now: 161))
-        let second = QuotaResetRetry(reset: 100, previous: first, now: 161)
-        XCTAssertFalse(second.allows(100, now: 460))
-        XCTAssertTrue(second.allows(100, now: 461))
-        XCTAssertTrue(second.allows(400, now: 400))
+    func testEachQuotaWindowHasIndependentResetBackoff() {
+        let primary = QuotaResetEvent(bucket: "codex", window: "primary", resetsAt: 100)
+        let secondary = QuotaResetEvent(bucket: "codex", window: "secondary", resetsAt: 180)
+        var retries = QuotaResetRetries()
+        retries.record([primary], now: 101)
+        XCTAssertFalse(retries.allows(primary, now: 160))
+        XCTAssertTrue(retries.allows(primary, now: 161))
+        retries.record([primary], now: 161)
+        XCTAssertFalse(retries.allows(primary, now: 180))
+        XCTAssertFalse(retries.allows(secondary, now: 179))
+        XCTAssertTrue(retries.allows(secondary, now: 180))
+        retries.record([primary, secondary], now: 180)
+        XCTAssertFalse(retries.allows(primary, now: 240))
+        XCTAssertTrue(retries.allows(secondary, now: 240))
+        let replacement = QuotaResetEvent(bucket: "codex", window: "primary", resetsAt: 400)
+        retries.retain([secondary, replacement])
+        XCTAssertTrue(retries.allows(replacement, now: 400))
     }
 
     private func window(_ label: String, minutes: Double?, bucket: String = "codex",

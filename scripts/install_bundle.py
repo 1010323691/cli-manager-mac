@@ -34,6 +34,8 @@ def install(bundle, skill_source, apps, skills, full_source=None, link_dirs=()):
     apps, skills = apps.resolve(), skills.resolve()
     link_dirs = list(dict.fromkeys(path.resolve() for path in link_dirs))
     app = apps / APP
+    if "\n" in str(app) or "\r" in str(app):
+        raise ValueError("应用路径不能含换行符")
     companion = skills / SKILL
     skill_copies = {companion: skill_source}
     if full_source is not None:

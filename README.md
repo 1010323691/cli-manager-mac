@@ -60,7 +60,14 @@ done
 open -a "$app"
 ~~~
 
-在 Codex 和 Claude Code 各开一个新会话，确认可读取 `cli-manager` 与 `cli-manager-desktop`。需要调度时先读完整 Skill，并运行 `python3 -B <cli-manager路径>/scripts/delegate.py instance list` 查看现有实例。已有实例和账户由应用和两份 Skill 共同使用。提供方登录仍由用户在原生交互流程中完成。
+在 Codex 和 Claude Code 各开一个新会话，确认可读取 `cli-manager` 与 `cli-manager-desktop`。先用当前智能体目录里的配套脚本读取只读快照：
+
+~~~sh
+"$HOME/.codex/skills/cli-manager-desktop/scripts/manager" desktop snapshot
+# Claude Code 使用 "$HOME/.claude/skills/cli-manager-desktop/scripts/manager"
+~~~
+
+派工前阅读完整 Skill 的调度参考，并使用下文带规划会话凭证的 `manager planner`。完整 `cli-manager` 仍保留可独立使用的原 CLI 入口。直接调用其中的 `scripts/delegate.py` 会按原引擎的规则访问状态库，不经过桌面桥接的版本守卫或规划者归属检查。提供方登录由用户在原生交互流程中完成。
 
 ## 仅构建或启动
 
@@ -79,7 +86,7 @@ open ".build/CLI Manager.app"
 - 每八秒读取本地状态并检查是否有新的调用事件、已到点的重置或待查询的账户。不满 100% 的窗口保存提供方报告的重置时间。额度查询未返回新读数时，重置重试逐步退避。一次轮询间隔内已经结束的短调用会合并为退出后的查询。读取本地状态只加载本机快照。
 - 侧栏选择决定主窗口显示哪个实例的终端。顶边摘要显示有活动的托管任务。为任务选路时，智能体仍通过 `task submit --instance <实例>` 指定用户授权的实例。提供方查询不能区分主动外部退出与认证过期时，曾绑定账户的实例显示「登录失效」。
 - 登录和切换在 Terminal.app 中进行，由提供方的真实 CLI 打开授权流程。应用只从临时回执读取退出码。账户代次改变后，之前绑定到旧代次的任务需重新指定。运行中的实例及仍被任务或账户引用的实例按 CLI 的规则保护。
-- 默认使用当前 CLI 的 `~/.cli-delegate-v2`。可用 `CLI_MANAGER_STATE` 指定隔离目录，或用 `CLI_MANAGER_PYTHON` 指定 Python 的绝对路径。默认搜索 `~/.local/bin`、Homebrew 和系统 PATH。应用源码在 `Sources/`，Python 适配层在 `bridge/`。打包时复制指定 CLI 源码中的运行时和参考文档，应用和 Skill 从同一份包内 CLI 执行操作。打包固定引擎源于 Git 提交 `8bc75540d8fd742a3fe48766afba7d676f6d37b3`，定义见 `resources/engine-revision`。包内引擎检查现有状态库的结构和版本，遇到不匹配时停止账户、任务和实例写入。升级引擎后需要更新锁定版本、核对状态库契约并重新打包。
+- 默认使用当前 CLI 的 `~/.cli-delegate-v2`。可用 `CLI_MANAGER_STATE` 指定隔离目录，或用 `CLI_MANAGER_PYTHON` 指定 Python 的绝对路径。默认搜索 `~/.local/bin`、Homebrew 和系统 PATH。应用源码在 `Sources/`，Python 适配层在 `bridge/`。打包时复制指定 CLI 源码中的运行时和参考文档，应用和桌面配套 Skill 使用同一个包内 CLI。打包固定引擎源于 Git 提交 `8bc75540d8fd742a3fe48766afba7d676f6d37b3`，定义见 `resources/engine-revision`。包内引擎检查现有状态库的结构和版本，遇到不匹配时停止账户、任务和实例写入。升级引擎后需要更新锁定版本、核对状态库契约并重新打包。
 
 ## 委托任务的决策归属
 
@@ -126,4 +133,4 @@ swift test --build-system native --scratch-path .build/native-terminal-check
 codesign --verify --strict ".build/CLI Manager.app"
 ~~~
 
-测试通过隔离状态库、真实 CLI 命令入口和本地模拟提供方覆盖交互式认证、已有记录守卫、额度时效、队列和删除条件。UI 布局参考了 [Apple 的材质指南](https://developer.apple.com/design/human-interface-guidelines/materials)、[菜单栏指南](https://developer.apple.com/design/human-interface-guidelines/the-menu-bar) 和 [Boring Notch 的悬停交互](https://github.com/TheBoredTeam/boring.notch)。
+Python 集成测试从同一个 Git 固定提交导出引擎到临时目录。测试通过隔离状态库、真实 CLI 命令入口和本地模拟提供方覆盖交互式认证、已有记录守卫、额度时效、队列和删除条件。UI 布局参考了 [Apple 的材质指南](https://developer.apple.com/design/human-interface-guidelines/materials)、[菜单栏指南](https://developer.apple.com/design/human-interface-guidelines/the-menu-bar) 和 [Boring Notch 的悬停交互](https://github.com/TheBoredTeam/boring.notch)。

@@ -13,8 +13,29 @@ enum TerminalDirectory {
         return directory
     }
 
+    private struct Identity: Equatable {
+        let device: NSNumber
+        let inode: NSNumber
+
+        init?(_ directory: URL) {
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: directory.path),
+                  let device = attributes[.systemNumber] as? NSNumber,
+                  let inode = attributes[.systemFileNumber] as? NSNumber else { return nil }
+            self.device = device
+            self.inode = inode
+        }
+    }
+
     private static func contains(_ parent: URL, _ child: URL) -> Bool {
-        child.pathComponents.starts(with: parent.pathComponents)
+        if child.pathComponents.starts(with: parent.pathComponents) { return true }
+        guard let identity = Identity(parent) else { return false }
+        var components = child.pathComponents
+        while !components.isEmpty {
+            let ancestor = URL(fileURLWithPath: NSString.path(withComponents: components), isDirectory: true)
+            if Identity(ancestor) == identity { return true }
+            components.removeLast()
+        }
+        return false
     }
 }
 
