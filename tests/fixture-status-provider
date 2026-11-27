@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Isolated Codex app-server and real foreground TTY fixture."""
+import fcntl
+import json
+import os
+import struct
+import sys
+import termios
+import time
+from pathlib import Path
+
+root = Path(os.environ["CODEX_HOME"])
+name = root.parent.name
+account_alias = root / "fixture-account"
+account_name = account_alias.read_text().strip() if account_alias.exists() else name
+mode = (root / "fixture-mode").read_text().strip()
+args = sys.argv[1:]
+
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+
+if args == ["--version"]:
+    print("codex-cli 0.171.0 (Local status fixture)")
+elif args == ["features", "list"]:
+    print("image_generation stable true")
+elif args and args[0] == "app-server":
+    for line in sys.stdin:
+        item = json.loads(line)
+        if "id" not in item:
+            continue
+        method = item.get("method")
+        if method == "initialize" and (counter := root / "fixture-query-count").exists():
+            with counter.open("a") as stream:
+                stream.write("query\n")
+        if method == "initialize" and mode in {"wait-success", "wait-failure"}:
+            (root / "probe-entered").touch()
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline and not (root / "probe-release").exists():
+                time.sleep(.025)
+        if method == "initialize" and mode in {"failure", "wait-failure"}:
+            print("Operation not permitted • private-fixture-stderr", file=sys.stderr, flush=True)
+            emit({"id": item["id"], "error": {"message": "private-fixture-rpc"}})
+            continue
+        if method == "model/list" and mode == "wait":
+            (root / "probe-entered").touch()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not (root / "probe-release").exists():
+                time.sleep(.025)
+        if method == "account/read" and mode == "malformed":
+            result = {}
+        elif method == "account/read" and mode != "signed-out":
+            email = f"{account_name}@example.invalid"
+            result = {"account": {"type": "chatgpt", "email": email, "planType": "plus"},
+                      "workspaceRouting": {"chatgptAccountId": f"workspace-{account_name}"}}
+        elif method == "account/read":
+            result = {"account": None}
+        elif method == "account/rateLimits/read":
+            used = 100 if mode == "limited" else 24
+            result = {"rateLimits": {"limitId": "codex",
+                                      "primary": {"usedPercent": used, "resetsAt": time.time() + 3600,
+                                                  "windowDurationMins": 300}}}
+            if mode in {"dual", "limited", "wait-success"}:
+                result["rateLimits"]["secondary"] = {
+                    "usedPercent": 53, "resetsAt": time.time() + 4 * 86400, "windowDurationMins": 10080
+                }
+        else:
+            result = {"data": []} if method == "model/list" else {}
+        emit({"id": item["id"], "result": result})
+elif "--ask-for-approval" in args and "--sandbox" in args:
+    assert "--yolo" not in args and "workspace-write" in args and "on-request" in args
+    assert all(os.isatty(fd) for fd in (0, 1, 2))
+    assert os.getpgrp() == os.tcgetpgrp(0)
+    if mode == "dock":
+        result = {"instance": name, "profile": str(root), "directory": str(Path.cwd()),
+                  "provider_pid": os.getpid(), "wrapper_pid": os.getppid(), "tags": []}
+        receipt = Path("fixture-dock-session.json")
+
+        def save():
+            staged = receipt.with_suffix(".tmp")
+            staged.write_text(json.dumps(result))
+            staged.replace(receipt)
+
+        save()
+        print(f"\x1b[1;36m{name} · native PTY fixture\x1b[0m", flush=True)
+        print(f"工作目录 / Workspace: {Path.cwd().name}", flush=True)
+        print("Workspace ready · 中文回退 / English 0123456789", flush=True)
+        names = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
+        for heading, offset in (("ANSI", 30), ("Bright", 90)):
+            row = "  ".join(f"\x1b[{offset + index}m{label}\x1b[0m" for index, label in enumerate(names))
+            print(f"{heading:<6} {row}", flush=True)
+        print("\x1b[31m- 旧标签 / previous label\x1b[0m", flush=True)
+        print("\x1b[32m+ 新标签 / updated label\x1b[0m", flush=True)
+        print("\x1b[38;2;153;82;23m24-bit 原色 / Truecolor\x1b[0m", flush=True)
+        print("Permission · May this fixture read its project file? [y/N]", flush=True)
+        result["permission"] = input().strip().lower() == "y"
+        save()
+        print("Question · Which color should this session use?", flush=True)
+        result["answer"] = input().strip()
+        save()
+        print(f"Answer recorded: {result['answer']}", flush=True)
+        print("fixture> ", end="", flush=True)
+        for line in sys.stdin:
+            tag = line.strip()
+            if tag == "finish":
+                break
+            if tag == "size":
+                result["grid"] = struct.unpack("HHHH", fcntl.ioctl(0, termios.TIOCGWINSZ, bytes(8)))
+            else:
+                result["tags"].append(tag)
+            save()
+            print(f"Received by {name}: {tag}\nfixture> ", end="", flush=True)
+        sys.exit(0)
+    print("\x1b[1;36mLOCAL CODEX FIXTURE · Native interactive session\x1b[0m", flush=True)
+    print("Same isolated instance profile. Direct keyboard input goes to this PTY.", flush=True)
+    print("Permission · May this fixture read fixture-file.txt? [y/N]", flush=True)
+    accepted = input().strip().lower() == "y"
+    print("Question · Which color should the fixture use?", flush=True)
+    color = input().strip()
+    receipt = {"profile": str(root), "user_pid": os.getpid(), "directory": str(Path.cwd()),
+               "allowed_fixture_read": accepted, "answer": color}
+    Path("fixture-terminal-result.json").write_text(json.dumps(receipt))
+    print(f"Fixture complete · permission={accepted} · answer={color}", flush=True)
+else:
+    sys.exit(3)

@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Local Claude fixture using the engine's real approval MCP subprocess."""
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+args = sys.argv[1:]
+config = Path(os.environ["CLAUDE_CONFIG_DIR"])
+REPORT = {key: [] for key in ("completed", "changes", "tests", "unfinished", "risks", "recommendations")}
+
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+
+def request(server, rid, tool, inputs):
+    payload = {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+               "params": {"arguments": {"tool_name": tool, "input": inputs}}}
+    server.stdin.write(json.dumps(payload) + "\n")
+    server.stdin.flush()
+
+
+def receive(server):
+    return json.loads(json.loads(server.stdout.readline())["result"]["content"][0]["text"])
+
+
+if args == ["--version"]:
+    print("2.1.329 (Local decision fixture)")
+elif args == ["--help"]:
+    print("--restricted --strict-mcp-config --permission-prompts")
+elif args[:2] == ["auth", "status"]:
+    emit({"loggedIn": True, "authMethod": "claude.ai", "email": "planner-fixture@example.invalid",
+          "configDirectory": str(config)})
+elif "/usage" in args:
+    emit({"result": "Current session: 20% used"})
+elif args == ["--permission-mode", "default"]:
+    assert all(os.isatty(fd) for fd in (0, 1, 2))
+    print("Native fixture permission [y/N]", flush=True)
+    accepted = input().strip() == "y"
+    print("Native fixture question", flush=True)
+    answer = input().strip()
+    (Path.cwd() / "direct-receipt.json").write_text(json.dumps(
+        {"pid": os.getpid(), "profile": str(config), "allowed": accepted, "answer": answer}))
+    print("Native fixture complete", flush=True)
+else:
+    if "-p" not in args or "--mcp-config" not in args:
+        sys.exit(3)
+    sys.stdin.read()
+    mcp = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["cliapproval"]
+    emit({"type": "system", "subtype": "init", "model": "sonnet", "session_id": "decision-fixture-session"})
+    with subprocess.Popen([mcp["command"], *mcp["args"]], env={**os.environ, **mcp["env"]},
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as server:
+        ask = {"questions": [{"id": "color", "question": "fixture planner question"}]}
+        request(server, 1, "AskUserQuestion", ask)
+        approval_directory = Path(mcp["args"][-1]) / "approvals"
+        deadline = time.monotonic() + 4
+        while not (approval_directory / "001.request.json").exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("fixture MCP question was not published")
+            time.sleep(.02)
+        request(server, 2, "Read", {"file_path": "fixture-file.txt"})
+        results = [receive(server), receive(server)]
+        server.stdin.close()
+    allowed = [result for result in results if result["behavior"] == "allow"]
+    assert any(result["updatedInput"].get("answers", {}).get("color") == "blue" for result in allowed)
+    assert any(result["updatedInput"].get("file_path") == "fixture-file.txt" for result in allowed)
+    REPORT["completed"] = ["planner answered and scoped permission handled by the existing MCP bridge"]
+    emit({"type": "result", "is_error": False, "structured_output": REPORT, "session_id": "decision-fixture-session"})

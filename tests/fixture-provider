@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Local Claude protocol for desktop tests; it never contacts a provider."""
+import json
+import os
+import sys
+from pathlib import Path
+
+arguments = sys.argv[1:]
+directory = Path(os.environ["CLAUDE_CONFIG_DIR"])
+account = directory / "fixture-login"
+if arguments == ["--version"]:
+    print("2.1.329 (Desktop Fixture)")
+elif arguments[:2] == ["auth", "status"]:
+    print(json.dumps({"loggedIn": account.exists(), "authMethod": "claude.ai",
+                      "email": account.read_text().strip() if account.exists() else None,
+                      "configDirectory": str(directory)}))
+elif arguments[:2] == ["auth", "login"]:
+    assert sys.stdin.isatty(), "Expected a genuine interactive terminal"
+    account.write_text("fixture.private@example.invalid" if not (directory / "fixture-next").is_file()
+                       else (directory / "fixture-next").read_text())
+    print("Fixture login complete")
+elif arguments[:2] == ["auth", "logout"]:
+    assert sys.stdin.isatty(), "Expected a genuine interactive terminal"
+    account.unlink(missing_ok=True)
+    print("Fixture logout complete")
+elif "/usage" in arguments:
+    percent = int((directory / "fixture-used").read_text()) if (directory / "fixture-used").exists() else 28
+    print(json.dumps({"result": f"Current session: {percent}% used"}))
+else:
+    sys.exit(3)

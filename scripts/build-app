@@ -1,0 +1,78 @@
+#!/bin/bash
+set -euo pipefail
+
+project="$(cd "$(dirname "$0")/.." && pwd -P)"
+legacy="${CLI_MANAGER_LEGACY_SOURCE:-$(dirname "$project")/cli-manager}"
+configuration="${CONFIGURATION:-release}"
+build_output="$project/.build"
+if [[ "$configuration" == debug ]]; then build_output="$build_output/DebugApp"; fi
+output="$build_output/CLI Manager.app"
+publication=replace
+if [[ -n "${CLI_MANAGER_APP_OUTPUT:-}" ]]; then
+    output="$CLI_MANAGER_APP_OUTPUT"
+    publication=exclusive
+    [[ "$output" == /*.app && ! -e "$output" && ! -L "$output" ]] || {
+        printf 'Alternate .app output must be an absent absolute path.\n' >&2
+        exit 1
+    }
+    build_output="$(dirname "$output")"
+fi
+if [[ -n "${CLI_MANAGER_BUNDLE_ID:-}" && -z "${CLI_MANAGER_APP_OUTPUT:-}" ]]; then
+    printf 'An alternate bundle identifier requires an alternate output path.\n' >&2
+    exit 1
+fi
+
+if [[ ! -f "$legacy/scripts/delegate.py" ]]; then
+    printf '%s\n' "Missing CLI Manager source at $legacy. Set CLI_MANAGER_LEGACY_SOURCE to the pinned CLI Manager checkout." >&2
+    exit 1
+fi
+
+IFS= read -r revision < "$project/resources/engine-revision"
+source_revision="$(/usr/bin/git -C "$legacy" log -1 --format=%H -- scripts backends references README.md)"
+if [[ "$source_revision" != "$revision" ]]; then
+    printf 'CLI Manager runtime source must match %s before building.\n' "$revision" >&2
+    exit 1
+fi
+
+scratch="${CLI_MANAGER_BUILD_SCRATCH:-$project/.build/native-terminal-check}"
+[[ "$scratch" == /* ]] || { printf '%s\n' 'Build scratch path must be absolute.' >&2; exit 1; }
+# SwiftTerm's CPU renderer works with SwiftPM's copied shader resource. The
+# Xcode build system otherwise requires the optional Metal toolchain even for CPU use.
+swift_build=(/usr/bin/swift build --build-system native --scratch-path "$scratch" --package-path "$project" --configuration "$configuration")
+"${swift_build[@]}" >&2
+binary_dir="$("${swift_build[@]}" --show-bin-path)"
+mkdir -p "$build_output"
+stage="$(mktemp -d "$build_output/.cli-manager-bundle.XXXXXXXX")"
+bundle="$stage/CLI Manager.app"
+publishing=0
+cleanup() {
+    if (( publishing )) && [[ "$publication" == replace && ( -e "$bundle" || -L "$bundle" ) ]]; then
+        printf 'Unconfirmed staged bundle preserved at %s\n' "$bundle" >&2
+    else
+        rm -rf "$stage"
+    fi
+}
+trap cleanup EXIT
+resources="$bundle/Contents/Resources"
+mkdir -p "$bundle/Contents/MacOS" "$resources/Legacy" "$stage/CLIManager.iconset"
+/usr/bin/install -m 755 "$binary_dir/CLIManager" "$bundle/Contents/MacOS/CLIManager"
+/usr/bin/install -m 644 "$project/resources/Info.plist" "$bundle/Contents/Info.plist"
+if [[ -n "${CLI_MANAGER_BUNDLE_ID:-}" ]]; then
+    /usr/bin/plutil -replace CFBundleIdentifier -string "$CLI_MANAGER_BUNDLE_ID" "$bundle/Contents/Info.plist"
+fi
+/usr/bin/ditto "$binary_dir/SwiftTerm_SwiftTerm.bundle" "$resources/SwiftTerm_SwiftTerm.bundle"
+/usr/bin/install -m 644 "$scratch/checkouts/SwiftTerm/LICENSE" "$resources/SwiftTerm-LICENSE.txt"
+for source in "$project/bridge/"*.py; do
+    /usr/bin/install -m 644 "$source" "$resources/$(basename "$source")"
+done
+/usr/bin/install -m 644 "$project/resources/engine-revision" "$resources/engine-revision"
+/usr/bin/git -C "$legacy" archive "$revision" -- scripts backends references README.md |
+    /usr/bin/tar -xf - -C "$resources/Legacy"
+/usr/bin/swift "$project/scripts/make-icon.swift" "$stage/CLIManager.iconset"
+/usr/bin/iconutil -c icns "$stage/CLIManager.iconset" -o "$resources/CLIManager.icns"
+/usr/bin/plutil -lint "$bundle/Contents/Info.plist" >&2
+/usr/bin/codesign --force --sign - "$bundle" >&2
+/usr/bin/codesign --verify --strict "$bundle"
+publishing=1
+/usr/bin/swift "$project/scripts/publish-app.swift" "$publication" "$bundle" "$output"
+printf '%s\n' "$output"
