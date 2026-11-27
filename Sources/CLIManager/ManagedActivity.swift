@@ -108,12 +108,12 @@ struct ManagedActivityPane: View {
             do {
                 let next = try await model.managedOutput(for: attempt)
                 guard !Task.isCancelled else { return }
+                let appearedToEnd = next.state == "ended" && output?.state != "ended"
                 output = next
                 failedAttempt = nil
-                if next.state == "ended" {
-                    await model.refresh()
-                    return
-                }
+                if appearedToEnd { await model.refresh() }
+                // The provider may resume the same attempt before the snapshot
+                // drops it from this view. Keep polling while the pane is mounted.
             } catch {
                 guard !Task.isCancelled else { return }
                 failedAttempt = attempt.id

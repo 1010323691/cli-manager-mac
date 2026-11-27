@@ -335,6 +335,7 @@ final class Dashboard: ObservableObject {
     private var runtime: Runtime?
     private let reloads = SnapshotReload()
     @Published private var terminalSessions: [String: UserTerminalSession] = [:]
+    @Published private var presentedManualTerminal: UUID?
     @Published private var terminalDirectories: [String: String]
     private let preferences: UserDefaults?
     private let stateDirectory: URL
@@ -376,6 +377,7 @@ final class Dashboard: ObservableObject {
     var signedInCount: Int { instances.filter { $0.login == "signed_in" }.count }
 
     func choose(_ instance: String?) {
+        if instance != selection { presentedManualTerminal = nil }
         selection = instance
         preferences?.set(instance, forKey: "selectedInstance")
     }
@@ -401,6 +403,15 @@ final class Dashboard: ObservableObject {
     var runningUserTerminals: Bool { terminalSessions.values.contains { $0.phase.isActive } }
 
     func terminalSession(for instance: InstanceRecord) -> UserTerminalSession? { terminalSessions[instance.terminalKey] }
+
+    func prefersManualTerminal(_ session: UserTerminalSession?) -> Bool {
+        guard let session, session.phase.isActive else { return false }
+        return presentedManualTerminal == session.id
+    }
+
+    func presentManualTerminal(_ session: UserTerminalSession?) {
+        presentedManualTerminal = session?.id
+    }
 
     func terminalDirectory(for instance: InstanceRecord) -> URL? {
         if let session = terminalSession(for: instance), session.phase.isActive { return session.directory }

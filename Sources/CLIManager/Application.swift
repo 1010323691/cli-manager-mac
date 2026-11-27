@@ -363,6 +363,8 @@ private final class ApplicationController: NSObject, NSApplicationDelegate {
                 throw VisualEvidence.failure("Unexpected terminal size, font metrics or process change")
             }
             window.setFrame(savedFrame, display: true)
+            try await checkCoexistingWorkspace(a, originalPID: aPID, directory: aDirectory,
+                                              state: URL(fileURLWithPath: state, isDirectory: true), window: window)
             VisualEvidence.frames.removeValue(forKey: "terminal-start")
             a.stop()
             try await waitForFixture("explicit Alpha stop and an idle workspace") {
@@ -387,12 +389,47 @@ private final class ApplicationController: NSObject, NSApplicationDelegate {
                 "dark_application_light_workspace": true,
             ], options: [.prettyPrinted, .sortedKeys])
             try data.write(to: directory.appendingPathComponent("terminal-session-proof.json"))
-            try Data("Two native PTYs preserved across switching and automatic refresh.\n".utf8)
+            try Data("Two native PTYs preserved across switching, automatic refresh, and coexisting managed output.\n".utf8)
                 .write(to: directory.appendingPathComponent("dock-result"), options: .atomic)
         } catch {
             try? Data(error.localizedDescription.utf8).write(to: directory.appendingPathComponent("dock-result"), options: .atomic)
         }
         if await finishUserTerminals() { NSApp.terminate(nil) }
+    }
+
+    private func checkCoexistingWorkspace(_ session: UserTerminalSession, originalPID: Int32,
+                                         directory: URL, state: URL, window: NSWindow) async throws {
+        let request = state.appendingPathComponent("coexist-request")
+        let response = state.appendingPathComponent("coexist-response")
+        func publish(_ phase: String) async throws {
+            try Data(phase.utf8).write(to: request, options: .atomic)
+            try await waitForFixture("coexisting task \(phase)") {
+                (try? String(contentsOf: response, encoding: .utf8)) == phase
+            }
+            await dashboard.refresh()
+        }
+
+        VisualEvidence.frames.removeValue(forKey: "managed-output")
+        try await publish("active")
+        try await waitForFixture("managed output resumes on the same attempt") {
+            session.terminal.window == nil && VisualEvidence.frames["managed-output"] != nil
+        }
+        guard session.phase.isActive, session.terminal.process.shellPid == originalPID,
+              window.firstResponder !== session.terminal,
+              FileManager.default.fileExists(atPath: state.appendingPathComponent("coexist-ended-served").path) else {
+            throw VisualEvidence.failure("Managed output used the manual terminal or missed the resumed attempt")
+        }
+        dashboard.presentManualTerminal(session)
+        try await waitForFixture("reattached manual terminal") { session.terminal.window === window }
+        guard session.terminal.process.shellPid == originalPID else {
+            throw VisualEvidence.failure("Switching out of managed output replaced the manual PTY")
+        }
+        sendDockFixture("after-managed-output\n", to: session)
+        try await waitForFixture("manual input after switching back") {
+            (self.receipt(directory)?["tags"] as? [String])?.contains("after-managed-output") == true
+        }
+        try await publish("ended")
+        dashboard.presentManualTerminal(nil)
     }
 
     private func measuredGrid(_ session: UserTerminalSession, directory: URL) async throws -> [Int] {

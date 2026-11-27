@@ -249,30 +249,48 @@ struct Management: View {
         let session = model.terminalSession(for: instance)
         let active = session?.phase.isActive == true
         let directory = model.terminalDirectory(for: instance)
-        let managed = active ? [] : model.managedAttempts(for: instance)
+        let managed = model.managedAttempts(for: instance)
+        let coexist = active && !managed.isEmpty
+        let showsManaged = !managed.isEmpty && !model.prefersManualTerminal(session)
         return VStack(spacing: 0) {
             HStack(spacing: 10) {
-                if managed.isEmpty {
+                if coexist {
+                    Picker("工作区视图", selection: Binding(get: { !showsManaged }, set: {
+                        model.presentManualTerminal($0 ? session : nil)
+                    })) {
+                        Text("托管输出").tag(false)
+                        Text("手动终端").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 148)
+                    .accessibilityLabel("工作区视图")
+                    .accessibilityIdentifier("workspace-source")
+                }
+                if !showsManaged {
                     directoryControl(instance, directory: directory, active: active)
-                } else {
+                } else if !coexist {
                     Label("托管任务", systemImage: "waveform.path").fontWeight(.medium)
                 }
                 Spacer(minLength: 12)
-                if let session, active {
+                if showsManaged {
+                    StateBadge(data: BadgeData("只读", "lock", .secondary))
+                } else if let session, active {
                     StateBadge(data: session.phase.badge)
+                } else {
+                    StateBadge(data: BadgeData("未启动", "circle", .secondary))
+                }
+                if let session, active {
+                    let stopTitle = coexist ? "结束手动会话" : "结束会话"
                     Button {
                         route = .stop(session)
                     } label: {
                         Image(systemName: "stop.circle").frame(width: 15, height: 17)
                     }
-                    .help("结束会话")
-                    .accessibilityLabel("结束会话")
+                    .help(stopTitle)
+                    .accessibilityLabel(stopTitle)
                     .accessibilityIdentifier("terminal-stop")
                     .disabled(session.phase == .stopping)
-                } else if !managed.isEmpty {
-                    StateBadge(data: BadgeData("只读", "lock", .secondary))
-                } else {
-                    StateBadge(data: BadgeData("未启动", "circle", .secondary))
                 }
                 Button {
                     Task { await model.refresh() }
@@ -304,11 +322,11 @@ struct Management: View {
             }
             .measureFixture("toolbar")
             VStack(spacing: 0) {
-                if let session, active {
-                    DockedTerminal(session: session)
-                } else if !managed.isEmpty {
+                if showsManaged {
                     ManagedActivityPane(model: model, attempts: managed)
                         .id(instance.terminalKey)
+                } else if let session, active {
+                    DockedTerminal(session: session)
                 } else {
                     idleTerminal(instance)
                     if let session, case let .failed(message) = session.phase {
