@@ -198,6 +198,38 @@ class DesktopTest(unittest.TestCase):
             store.put("tasks", {**task, "state": state})
             self.assertEqual([row["task_id"] for row in self.bridge("snapshot")["live_attempts"]], ["stopping"])
 
+    def test_managed_output_requires_current_live_attempt_and_safe_log(self):
+        self.install_instance()
+        store = self.open_store()
+        task = {"id": "test-activity", "state": "running", "attempt": "test-attempt"}
+        attempt = {"id": "test-attempt", "task": task["id"], "instance": "alpha", "state": "running",
+                   "pid": os.getpid(), "identity": controller.identity(os.getpid())}
+        run = store.attempt_dir(attempt) / "runs" / "run-test"
+        run.mkdir(parents=True)
+        attempt["logs"] = str(run)
+        log = run / "events.jsonl"
+        payload = {"type": "assistant", "uuid": "first", "message": {"role": "assistant",
+                    "content": [{"type": "text", "text": "正在检查测试工作区。"}]}}
+        log.write_text(json.dumps(payload) + "\n")
+        store.put("tasks", task)
+        store.put("attempts", attempt)
+
+        args = ("managed-output", task["id"], attempt["id"], "alpha")
+        result = self.bridge(*args)
+        self.assertEqual(result["state"], "available")
+        self.assertEqual([row["text"] for row in result["entries"]], ["正在检查测试工作区。"])
+        self.assertEqual(self.bridge(*args[:-1], "incorrect-instance")["entries"], [])
+        store.put("attempts", {**attempt, "identity": "different-process"})
+        self.assertEqual(self.bridge(*args)["state"], "ended")
+        store.put("attempts", attempt)
+        log.unlink()
+        external = self.root / "external"
+        external.write_text(json.dumps(payload) + "\n")
+        log.symlink_to(external)
+        self.assertEqual(self.bridge(*args)["state"], "unavailable")
+        store.put("tasks", {**task, "state": "review"})
+        self.assertEqual(self.bridge(*args)["state"], "ended")
+
     def test_directory_overlap_uses_filesystem_identity(self):
         parent = self.root / "Workspace"
         state = parent / "State"

@@ -1,5 +1,6 @@
 """Drive a signed debug app against fixture state and local fake providers."""
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -19,9 +20,16 @@ def add_activity(store, pid, phase):
             state = ("running" if index == 0 else "stopping") if verified else "review"
             store.put("tasks", {"id": task, "state": state, "kind": "review",
                                 "allowed": [instance], "attempt": attempt})
-            store.put("attempts", {"id": attempt, "task": task, "instance": instance,
-                                   "state": state, "pid": pid, "identity": controller.identity(pid),
-                                   "start": stamp + index / 10})
+            row = {"id": attempt, "task": task, "instance": instance, "state": state, "pid": pid,
+                   "identity": controller.identity(pid), "start": stamp + index / 10}
+            if verified:
+                run = store.attempt_dir(row) / "runs" / "run-fixture"
+                run.mkdir(parents=True, exist_ok=True)
+                event = {"dir": "in", "method": "item/completed", "params": {"item": {
+                    "id": "message", "type": "agentMessage", "phase": "commentary", "text": "正在检查测试工作区。"}}}
+                (run / "events.jsonl").write_text(json.dumps(event, ensure_ascii=False) + "\n")
+                row["logs"] = str(run)
+            store.put("attempts", row)
     # An unverified managed record should never appear in the activity overlay.
     store.put("tasks", {"id": "unverified-fixture", "state": "running", "attempt": "unverified-attempt"})
     store.put("attempts", {"id": "unverified-attempt", "task": "unverified-fixture",

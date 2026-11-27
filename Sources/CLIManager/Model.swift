@@ -357,6 +357,21 @@ final class Dashboard: ObservableObject {
         guard snapshotError == nil else { return [] }
         return LiveAttempt.normalized(snapshot?.liveAttempts ?? [])
     }
+    func managedAttempts(for instance: InstanceRecord) -> [LiveAttempt] {
+        liveAttempts.filter { $0.instance == instance.id }
+    }
+
+    func managedOutput(for attempt: LiveAttempt) async throws -> ManagedOutput {
+        let runtime = try await connection()
+        let result: ManagedOutput = try await runtime.run(
+            ["managed-output", attempt.taskID, attempt.attemptID, attempt.instance], timeout: 4
+        )
+        guard result.schema == 1, result.attemptID == attempt.attemptID else {
+            throw CLIError.configuration("无法核实托管任务输出。")
+        }
+        return result
+    }
+
     var queueCount: Int { tasks.filter { ["queued", "waiting_quota"].contains($0.state) }.count }
     var signedInCount: Int { instances.filter { $0.login == "signed_in" }.count }
 

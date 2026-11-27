@@ -43,8 +43,16 @@ swift_build=(/usr/bin/swift build --build-system native --scratch-path "$scratch
 binary_dir="$("${swift_build[@]}" --show-bin-path)"
 mkdir -p "$build_output"
 stage="$(mktemp -d "$build_output/.cli-manager-bundle.XXXXXXXX")"
-trap 'rm -rf "$stage"' EXIT
 bundle="$stage/CLI Manager.app"
+publishing=0
+cleanup() {
+    if (( publishing )) && [[ "$publication" == replace && ( -e "$bundle" || -L "$bundle" ) ]]; then
+        printf 'Unconfirmed staged bundle preserved at %s\n' "$bundle" >&2
+    else
+        rm -rf "$stage"
+    fi
+}
+trap cleanup EXIT
 resources="$bundle/Contents/Resources"
 mkdir -p "$bundle/Contents/MacOS" "$resources/Legacy" "$stage/CLIManager.iconset"
 /usr/bin/install -m 755 "$binary_dir/CLIManager" "$bundle/Contents/MacOS/CLIManager"
@@ -65,5 +73,6 @@ done
 /usr/bin/plutil -lint "$bundle/Contents/Info.plist" >&2
 /usr/bin/codesign --force --sign - "$bundle" >&2
 /usr/bin/codesign --verify --strict "$bundle"
+publishing=1
 /usr/bin/swift "$project/scripts/publish-app.swift" "$publication" "$bundle" "$output"
 printf '%s\n' "$output"

@@ -249,27 +249,28 @@ struct Management: View {
         let session = model.terminalSession(for: instance)
         let active = session?.phase.isActive == true
         let directory = model.terminalDirectory(for: instance)
+        let managed = active ? [] : model.managedAttempts(for: instance)
         return VStack(spacing: 0) {
             HStack(spacing: 10) {
-                directoryControl(instance, directory: directory, active: active)
+                if managed.isEmpty {
+                    directoryControl(instance, directory: directory, active: active)
+                } else {
+                    Label("托管任务", systemImage: "waveform.path").fontWeight(.medium)
+                }
                 Spacer(minLength: 12)
-                if let session {
+                if let session, active {
                     StateBadge(data: session.phase.badge)
-                    if session.phase.isActive {
-                        Button {
-                            route = .stop(session)
-                        } label: {
-                            Image(systemName: "stop.circle").frame(width: 15, height: 17)
-                        }
-                        .help("结束会话")
-                        .accessibilityLabel("结束会话")
-                        .accessibilityIdentifier("terminal-stop")
-                        .disabled(session.phase == .stopping)
-                    } else {
-                        Button("重新启动") { startTerminal(instance) }
-                            .disabled(model.terminalStartBlocked(instance))
-                            .accessibilityIdentifier("terminal-restart")
+                    Button {
+                        route = .stop(session)
+                    } label: {
+                        Image(systemName: "stop.circle").frame(width: 15, height: 17)
                     }
+                    .help("结束会话")
+                    .accessibilityLabel("结束会话")
+                    .accessibilityIdentifier("terminal-stop")
+                    .disabled(session.phase == .stopping)
+                } else if !managed.isEmpty {
+                    StateBadge(data: BadgeData("只读", "lock", .secondary))
                 } else {
                     StateBadge(data: BadgeData("未启动", "circle", .secondary))
                 }
@@ -303,9 +304,14 @@ struct Management: View {
             }
             .measureFixture("toolbar")
             VStack(spacing: 0) {
-                if let session {
+                if let session, active {
                     DockedTerminal(session: session)
-                    if case let .failed(message) = session.phase {
+                } else if !managed.isEmpty {
+                    ManagedActivityPane(model: model, attempts: managed)
+                        .id(instance.terminalKey)
+                } else {
+                    idleTerminal(instance)
+                    if let session, case let .failed(message) = session.phase {
                         Label(message, systemImage: "exclamationmark.circle")
                             .font(.caption)
                             .foregroundStyle(legible(.orange, in: scheme))
@@ -314,8 +320,6 @@ struct Management: View {
                             .frame(height: 27)
                             .background(.bar)
                     }
-                } else {
-                    idleTerminal(instance)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -363,6 +367,7 @@ struct Management: View {
                     .tint(WorkspacePalette.color(WorkspacePalette.accent))
                     .disabled(blocked)
                     .accessibilityIdentifier("terminal-start")
+                    .measureFixture("terminal-start")
                 if blocked {
                     Button("查看实例设置") { route = .settings(instance) }.buttonStyle(.link)
                 }
@@ -686,7 +691,7 @@ struct CreateSheet: View {
 }
 
 
-private extension View {
+extension View {
     @ViewBuilder
     func measureFixture(_ key: String) -> some View {
         #if DEBUG

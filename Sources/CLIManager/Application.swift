@@ -207,7 +207,18 @@ private final class ApplicationController: NSObject, NSApplicationDelegate {
                     (self.dashboard.snapshot?.snapshotAt ?? 0) > previous && self.dashboard.liveAttempts.map(\.taskID) == expected
                 }
                 if phase == "active" {
+                    VisualEvidence.frames.removeValue(forKey: "managed-output")
                     dashboard.choose("codex-active")
+                    try await waitForFixture("managed output in the selected workspace") {
+                        VisualEvidence.frames["managed-output"] != nil
+                    }
+                    guard let attempt = dashboard.liveAttempts.first(where: { $0.instance == "codex-active" }),
+                          try await dashboard.managedOutput(for: attempt).entries.contains(where: {
+                              $0.text == "正在检查测试工作区。"
+                          }) else {
+                        throw VisualEvidence.failure("Missing verified managed activity fixture")
+                    }
+                    window?.makeKeyAndOrderFront(nil)
                     try await VisualEvidence.settle()
                     let current = window?.contentView
                     try VisualEvidence.capture(current?.superview ?? current, to: directory.appendingPathComponent("mixed-sidebar.png"))
@@ -352,8 +363,12 @@ private final class ApplicationController: NSObject, NSApplicationDelegate {
                 throw VisualEvidence.failure("Unexpected terminal size, font metrics or process change")
             }
             window.setFrame(savedFrame, display: true)
+            VisualEvidence.frames.removeValue(forKey: "terminal-start")
             a.stop()
-            try await waitForFixture("explicit Alpha stop") { !a.phase.isActive }
+            try await waitForFixture("explicit Alpha stop and an idle workspace") {
+                !a.phase.isActive && a.terminal.window == nil && VisualEvidence.frames["terminal-start"] != nil
+            }
+            try captureManagementFixture(to: directory.appendingPathComponent("terminal-stopped.png"))
             guard b.phase.isActive, b.terminal.process.shellPid == bPID else {
                 throw VisualEvidence.failure("Beta changed after explicitly stopping Alpha: \(b.phase), PID \(b.terminal.process.shellPid)")
             }

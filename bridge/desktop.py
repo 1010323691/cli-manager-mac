@@ -26,6 +26,7 @@ if not LEGACY.is_dir() and (HERE.parent / "Package.swift").is_file():
     LEGACY = Path(source).expanduser().resolve() if source else HERE.parent.parent / "cli-manager"
 sys.path[:0] = [str(LEGACY / "scripts"), str(HERE)]
 
+import activity_output
 import delegate
 import ownership
 import probes
@@ -430,11 +431,53 @@ def snapshot():
     return result
 
 
+def managed_output(task_id, attempt_id, instance_id):
+    result = {"schema": SCHEMA, "attempt_id": attempt_id, "state": "ended", "entries": []}
+    try:
+        store = SnapshotStore(state_root())
+    except FileNotFoundError:
+        return result
+    try:
+        store.db.execute("BEGIN")
+        task = store.get("tasks", task_id, required=False)
+        attempt = store.get("attempts", attempt_id, required=False)
+        instance = store.get("instances", instance_id, required=False)
+    finally:
+        store.db.close()
+    if (not task or not attempt or not instance or task.get("attempt") != attempt_id
+            or attempt.get("task") != task_id or attempt.get("instance") != instance_id
+            or task["state"] not in controller.ACTIVE or attempt["state"] not in controller.ACTIVE
+            or activity(attempt, time.time()) not in controller.ACTIVE):
+        return result
+    result["state"] = "waiting"
+    if attempt["state"] == "starting" or not isinstance(attempt.get("logs"), str):
+        return result
+    run = Path(attempt["logs"])
+    home = store.instance_dir(instance_id) / "attempts" / attempt_id / "runs"
+    if run.parent != home or not run.name.startswith("run-"):
+        result["state"] = "unavailable"
+        return result
+    try:
+        content = activity_output.events_tail(store.root, run)
+    except FileNotFoundError:
+        return result
+    except (OSError, ValueError):
+        result["state"] = "unavailable"
+        return result
+    result["entries"] = activity_output.projected_entries(content, instance["provider"])
+    result["state"] = "available" if result["entries"] else "waiting"
+    return result
+
+
 def parse():
     parser = argparse.ArgumentParser(prog="cli-manager-desktop", allow_abbrev=False)
     commands = parser.add_subparsers(dest="operation", required=True)
     commands.add_parser("snapshot")
     commands.add_parser("inspect-decisions")
+    output = commands.add_parser("managed-output")
+    output.add_argument("task", type=identifier)
+    output.add_argument("attempt", type=identifier)
+    output.add_argument("instance", type=identifier)
     terminal = commands.add_parser("terminal")
     terminal.add_argument("id", type=identifier)
     terminal.add_argument("--expect", required=True)
@@ -591,6 +634,8 @@ def dispatch(args):
     action = args.operation
     if action == "snapshot":
         return snapshot()
+    if action == "managed-output":
+        return managed_output(args.task, args.attempt, args.instance)
     if action == "inspect-decisions":
         try:
             store = SnapshotStore(state_root())
