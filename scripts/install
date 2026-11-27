@@ -1,0 +1,79 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+    printf '%s\n' "Usage: $0 --apps-dir ABSOLUTE_PATH --skills-dir ABSOLUTE_PATH [--with-cli-manager-skill] [--link-skills-dir ABSOLUTE_PATH ...]" >&2
+    exit 2
+}
+
+apps=
+skills=
+full_skill=0
+link_dirs=()
+link_count=0
+while (( $# )); do
+    case "$1" in
+        --apps-dir) [[ $# -ge 2 && -z "$apps" ]] || usage; apps="$2"; shift 2 ;;
+        --skills-dir) [[ $# -ge 2 && -z "$skills" ]] || usage; skills="$2"; shift 2 ;;
+        --with-cli-manager-skill) (( full_skill == 0 )) || usage; full_skill=1; shift ;;
+        --link-skills-dir)
+            [[ $# -ge 2 && "$2" == /* && "$2" != *$'\n'* ]] || usage
+            link_dirs+=("$2")
+            link_count=$((link_count + 1))
+            shift 2
+            ;;
+        *) usage ;;
+    esac
+done
+[[ "$apps" == /* && "$skills" == /* && "$apps" != *$'\n'* && "$skills" != *$'\n'* ]] || usage
+
+project="$(cd "$(dirname "$0")/.." && pwd -P)"
+destinations=("$apps/CLI Manager.app" "$skills/cli-manager-desktop")
+if (( full_skill )); then destinations+=("$skills/cli-manager"); fi
+if (( link_count )); then
+    for link_dir in "${link_dirs[@]}"; do
+        destinations+=("$link_dir/cli-manager-desktop")
+        if (( full_skill )); then destinations+=("$link_dir/cli-manager"); fi
+    done
+fi
+for destination in "${destinations[@]}"; do
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        printf 'Already exists: %s\n' "$destination" >&2
+        exit 1
+    fi
+done
+
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+if [[ -n "${CLI_MANAGER_PYTHON:-}" ]]; then
+    candidates=("$CLI_MANAGER_PYTHON")
+else
+    candidates=(python3 python3.14 python3.13 python3.12 python3.11)
+fi
+for candidate in "${candidates[@]}"; do
+    if "$candidate" -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+        mkdir -p "$project/.build"
+        staged="$(mktemp -d "$project/.build/install-package.XXXXXXXX")"
+        trap 'rm -rf "$staged"' EXIT
+        bundle="$(CLI_MANAGER_APP_OUTPUT="$staged/CLI Manager.app" CLI_MANAGER_BUNDLE_ID= "$project/scripts/build-app")"
+        arguments=("$bundle" "$project/skill/cli-manager-desktop" "$apps" "$skills")
+        if (( full_skill )); then
+            legacy="${CLI_MANAGER_LEGACY_SOURCE:-$(dirname "$project")/cli-manager}"
+            IFS= read -r revision < "$project/resources/engine-revision"
+            mkdir "$staged/cli-manager"
+            /usr/bin/git -C "$legacy" archive "$revision" -- . |
+                /usr/bin/tar -xf - -C "$staged/cli-manager"
+            if [[ ! -f "$staged/cli-manager/SKILL.md" || ! -f "$staged/cli-manager/scripts/delegate.py" ]]; then
+                printf '%s\n' "Pinned CLI Manager checkout does not contain the complete skill." >&2
+                exit 1
+            fi
+            arguments+=("$staged/cli-manager")
+        fi
+        if (( link_count )); then
+            for link_dir in "${link_dirs[@]}"; do arguments+=(--link-skills-dir "$link_dir"); done
+        fi
+        "$candidate" -I -B "$project/scripts/install_bundle.py" "${arguments[@]}"
+        exit 0
+    fi
+done
+printf '%s\n' "Python 3.11 or newer is required." >&2
+exit 2
