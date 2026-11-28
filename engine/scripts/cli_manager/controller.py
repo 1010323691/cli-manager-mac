@@ -836,7 +836,7 @@ def run_native(store, instance, task, attempt, directory, cancel):
         data.update(workspace.setup(directory, store.task_dir(task["id"]) / "baseline.git",
                                     task, attempt, patches, checkpoint))
     elif attempt.get("checkpoint_tree"):
-        # Only controlled files count: links to the original project's ignored content and
+        # Only controlled files count: ignored content brought in from the original project and
         # ignored artefacts left in the workspace (screenshots, logs) are not a deviation.
         changed = workspace.drift(Path(attempt["repo"]), Path(attempt["work"]), attempt,
                                   force_all=not task["baseline"]["git"])
@@ -845,8 +845,7 @@ def run_native(store, instance, task, attempt, directory, cancel):
             raise DelegateError(f"原生续跑的工作目录已偏离检查点（受控文件：{listed}）")
     if (task["kind"] != "image" and instance["provider"] == "codex" and access.is_open(access.of(task))
             and (data.get("work") or attempt.get("work"))):
-        data["mounts"], brought = workspace.mount_ignored(task, Path(data.get("work") or attempt["work"]),
-                                                          attempt.get("mounts") or ())
+        brought = workspace.mount_ignored(task, Path(data.get("work") or attempt["work"]))
         # Everything ever brought into this workspace stays excluded, across resumed runs too.
         data["imported"] = sorted({*(attempt.get("imported") or ()), *brought})
         if task["baseline"]["git"]:
@@ -918,8 +917,7 @@ def capture_result(store, task, attempt, result):
     if attempt.get("repo"):
         repo, work = Path(attempt["repo"]), Path(attempt["work"])
         try:
-            commit = workspace.snapshot(repo, work, attempt["base"], force_all=not task["baseline"]["git"],
-                                        exclude=attempt.get("mounts") or ())
+            commit = workspace.snapshot(repo, work, attempt["base"], force_all=not task["baseline"]["git"])
             workspace.git(repo, "update-ref", "refs/heads/checkpoint", commit)
             attempt.update(checkpoint=commit, checkpoint_tree=workspace.text(repo, "rev-parse", commit + "^{tree}"))
             paths = workspace.changes(attempt, commit)

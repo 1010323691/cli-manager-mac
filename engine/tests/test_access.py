@@ -181,21 +181,15 @@ class PolicyTest(unittest.TestCase):
         self.assertIsNone(access.classify_changes([{"path": str(self.work / "a"), "kind": "delete"}],
                                                   secrets=secrets, writable=[str(self.work)])[0])
 
-    def test_project_directory_is_never_a_read_root_and_links_grant_only_their_targets(self):
+    def test_project_directory_is_never_granted_to_the_sandbox(self):
         project = self.root / "project"
         (project / "node_modules").mkdir(parents=True)
-        (project / ".env").write_text("SECRET=1\n")
         task = {"kind": "code", "baseline": {"root": str(project)}}
         capabilities = access.normalize(self.store, None)
-        self.assertNotIn(str(project), access.read_roots(self.store, task, capabilities))
         instance = {"id": "one", "provider": "codex"}
         backend.environment(self.store, instance)
-        plain = backend.codex_grants(self.store, instance, task, {"instance": "one"}, capabilities)
-        linked = backend.codex_grants(self.store, instance, task, {"instance": "one", "mounts": ["node_modules"]},
-                                      capabilities)
-        self.assertNotIn(str(project / "node_modules"), plain["read"])
-        self.assertIn(str(project / "node_modules"), linked["read"])
-        self.assertNotIn(str(project), linked["read"])
+        grants = backend.codex_grants(self.store, instance, task, {"instance": "one"}, capabilities)
+        self.assertFalse([path for path in grants["read"] if Path(path).is_relative_to(project)])
 
     def test_brought_in_content_never_carries_credential_names(self):
         for name in (".pypirc", ".git-credentials", ".docker", "id.pem", ".env.local", "auth.json", ".netrc"):
@@ -211,48 +205,26 @@ class PolicyTest(unittest.TestCase):
         (project / "node_modules/pkg/index.js").write_text("ok\n")
         work.mkdir()
         task = {"baseline": {"root": str(project), "git": False}}
-        links, brought = workspace.mount_ignored(task, work)
-        self.assertEqual((links, brought), ([], ["node_modules"]))
+        self.assertEqual(workspace.mount_ignored(task, work), ["node_modules"])
         self.assertEqual((work / "node_modules/pkg/index.js").read_text(), "ok\n")
         self.assertFalse(os.path.lexists(work / "node_modules/pkg/.env"))
         self.assertFalse(os.path.lexists(work / "node_modules/pkg/keys/server.pem"))
         self.assertTrue((project / "node_modules/pkg/.env").is_file())
-        other = self.root / "linkwork"
-        other.mkdir()
-        # A link exposes everything beneath it: a mixed directory is rebuilt from its safe children.
-        links, brought = workspace.mount_ignored(task, other, cloning=False)
-        self.assertEqual((links, brought), (["node_modules/pkg/index.js"], ["node_modules"]))
-        self.assertFalse((other / "node_modules/pkg").is_symlink())
-        self.assertEqual((other / "node_modules/pkg/index.js").read_text(), "ok\n")
-        self.assertFalse(os.path.lexists(other / "node_modules/pkg/.env"))
-        self.assertEqual(os.listdir(other / "node_modules/pkg/keys"), [])
-        self.assertEqual(workspace.mount_ignored(task, other, links, cloning=False), (links, []))
-
-    def test_too_many_links_is_an_error_not_a_partial_workspace(self):
-        project, work = self.root / "many", self.root / "manywork"
-        for name in ("node_modules", ".venv"):
-            (project / name).mkdir(parents=True)
+    def test_content_that_cannot_be_cloned_stops_the_task_and_ignored_links_are_skipped(self):
+        project, work, outside = self.root / "cross", self.root / "crosswork", self.root / "outside"
+        (project / "node_modules").mkdir(parents=True)
+        outside.mkdir()
+        (project / ".venv").symlink_to(outside, target_is_directory=True)
         work.mkdir()
         task = {"baseline": {"root": str(project), "git": False}}
-        with patch.object(workspace, "LINK_LIMIT", 1), self.assertRaises(DelegateError):
-            workspace.mount_ignored(task, work, cloning=False)
-
-    def test_ignored_links_are_not_brought_in_and_grants_stay_inside_the_project(self):
-        project, work, outside = self.root / "linked", self.root / "linkedwork", self.root / "outside"
-        project.mkdir()
-        outside.mkdir()
-        (project / "node_modules").symlink_to(outside, target_is_directory=True)
-        work.mkdir()
-        task = {"kind": "code", "baseline": {"root": str(project), "git": False}}
-        for cloning in (True, False):
-            self.assertEqual(workspace.mount_ignored(task, work, cloning=cloning), ([], []))
-        self.assertFalse(os.path.lexists(work / "node_modules"))
-        # Even a recorded mount is not granted when it resolves outside the project.
-        instance = {"id": "one", "provider": "codex"}
-        backend.environment(self.store, instance)
-        grants = backend.codex_grants(self.store, instance, task, {"instance": "one", "mounts": ["node_modules"]},
-                                      access.normalize(self.store, None))
-        self.assertNotIn(str(outside), grants["read"])
+        with patch.object(workspace, "clone", return_value=False), self.assertRaises(DelegateError) as failure:
+            workspace.mount_ignored(task, work)
+        self.assertIn("node_modules", str(failure.exception))
+        self.assertEqual(os.listdir(work), [])
+        # An ignored path that is itself a link is never brought in.
+        self.assertEqual(workspace.mount_ignored(task, work), ["node_modules"])
+        self.assertFalse(os.path.lexists(work / ".venv"))
+        self.assertEqual(workspace.mount_ignored(task, work), [])
 
     def test_deletion_outside_the_workspace_is_irreversible_even_in_granted_directories(self):
         granted = self.root / "export"
@@ -363,7 +335,7 @@ class OpenTierTest(unittest.TestCase):
         attempt = status["attempts"][-1]
         self.assertEqual((attempt["capabilities"]["access"], attempt["capabilities"]["approvals"]),
                          ("sandbox", "denied"))
-        self.assertEqual(attempt.get("mounts"), None)
+        self.assertEqual(attempt.get("imported"), None)
         self.cli("task", "submit", "--project", self.project, "--instance", "codex1", "--prompt", "x",
                  "--access", "sandbox", "--network", "on", code=2)
 
@@ -498,8 +470,8 @@ class OpenTierTest(unittest.TestCase):
         status = self.wait("mount", {"review"})
         attempt = status["attempts"][-1]
         work = Path(attempt["work"])
-        # Same volume: a private copy-on-write clone, writable without touching the original.
-        self.assertEqual(attempt["mounts"], [])
+        # A private copy-on-write clone, writable without touching the original.
+        self.assertEqual(attempt["imported"], ["assets/raw", "node_modules"])
         self.assertFalse((work / "assets/raw").is_symlink())
         self.assertEqual((work / "assets/raw/sheet.png").read_text(), "original\n")
         self.assertTrue((work / "node_modules/pkg").is_dir())
@@ -514,32 +486,6 @@ class OpenTierTest(unittest.TestCase):
         revision = self.approve(status)
         preview = self.cli("task", "apply", "mount", "--revision", revision, "--check")
         self.assertEqual([change["path"] for change in preview["changes"]], ["change.txt"])
-
-    def test_links_replace_clones_across_volumes_and_never_enter_a_snapshot(self):
-        (self.project / ".gitignore").write_text("views/\nnode_modules\n")
-        self.git("add", ".gitignore")
-        self.git("commit", "-qm", "ignore")
-        (self.project / "art/views").mkdir(parents=True)
-        (self.project / "art/views/front.png").write_text("front\n")
-        (self.project / "node_modules").mkdir()
-        directory = self.root / "task"
-        directory.mkdir()
-        baseline = workspace.freeze(self.project, directory, [])
-        task = {"baseline": baseline}
-        attempt = {"id": "attempt"}
-        data = workspace.setup(directory, directory / "baseline.git", task, attempt, [])
-        repo, work = Path(data["repo"]), Path(data["work"])
-        mounts, brought = workspace.mount_ignored(task, work, cloning=False)
-        self.assertEqual((sorted(mounts), sorted(brought)), (["art/views", "node_modules"],) * 2)
-        self.assertEqual(os.path.realpath(work / "art/views"), str(self.project / "art/views"))
-        workspace.register_mounts(repo, mounts)
-        # `views/` names a directory, not a link: only the registration keeps the link out.
-        commit = workspace.snapshot(repo, work, data["base"])
-        self.assertEqual(commit, data["base"])
-        self.assertEqual(workspace.mount_ignored(task, work, mounts, cloning=False), (mounts, []))
-        (work / "change.txt").write_text("edited\n")
-        commit = workspace.snapshot(repo, work, data["base"])
-        self.assertEqual(workspace.changes({"repo": str(repo), "base": data["base"]}, commit), ["change.txt"])
 
     def test_content_ignored_only_by_the_original_repository_stays_out_of_checkpoints(self):
         (self.project / ".git/info").mkdir(exist_ok=True)

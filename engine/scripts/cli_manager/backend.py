@@ -47,7 +47,7 @@ OPEN_RULES = (
     "the manager state). Pushing, publishing, sending external messages and deleting files outside "
     "the workspace always need an explicit approval. Ignored content of the original project "
     "(source images, textures, node_modules) is already present in the workspace as copy-on-write "
-    "clones or read-only links; it never becomes part of your result, so do not move it into "
+    "clones; it never becomes part of your result, so do not move it into "
     "tracked paths. Run only checks the "
     "task needs. Return the requested structured report, listing unfinished work and the tests you ran."
 )
@@ -457,17 +457,8 @@ def codex_grants(store, instance, task, attempt, capabilities):
         return None
     base = store.instance_dir(instance["id"])
     home, cache = base / "home", base / "cache"
+    # Nothing of the original project is granted: its ignored content is cloned into the workspace.
     read = access.read_roots(store, task, capabilities, own=base)
-    # Links (the cross-volume fallback for ignored content) point into the original project:
-    # grant those targets only, never the project directory, which may hold `.env` files and keys.
-    root = (task.get("baseline") or {}).get("root")
-    secrets = access.credential_roots(store, own=base)
-    for name in attempt.get("mounts") or () if root else ():
-        target = os.path.realpath(Path(root) / name)
-        # Checked on every run: the grant must stay inside the project and clear of credentials.
-        if (target not in read and Path(target).is_relative_to(os.path.realpath(root))
-                and not access.grants_secret(target, secrets)):
-            read.append(target)
     images = base / "cli" / "generated_images"
     images.mkdir(mode=0o700, parents=True, exist_ok=True)
     skills = base / "cli" / "skills"  # Codex's bundled skill instructions (e.g. image generation)
