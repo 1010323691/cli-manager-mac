@@ -181,11 +181,55 @@ class PolicyTest(unittest.TestCase):
         self.assertIsNone(access.classify_changes([{"path": str(self.work / "a"), "kind": "delete"}],
                                                   secrets=secrets, writable=[str(self.work)])[0])
 
-    def test_project_directory_is_readable_only_behind_links(self):
-        task = {"baseline": {"root": str(self.work)}}
+    def test_project_directory_is_never_a_read_root_and_links_grant_only_their_targets(self):
+        project = self.root / "project"
+        (project / "node_modules").mkdir(parents=True)
+        (project / ".env").write_text("SECRET=1\n")
+        task = {"kind": "code", "baseline": {"root": str(project)}}
         capabilities = access.normalize(self.store, None)
-        self.assertNotIn(str(self.work), access.read_roots(self.store, task, capabilities))
-        self.assertIn(str(self.work), access.read_roots(self.store, task, capabilities, project=True))
+        self.assertNotIn(str(project), access.read_roots(self.store, task, capabilities))
+        instance = {"id": "one", "provider": "codex"}
+        backend.environment(self.store, instance)
+        plain = backend.codex_grants(self.store, instance, task, {"instance": "one"}, capabilities)
+        linked = backend.codex_grants(self.store, instance, task, {"instance": "one", "mounts": ["node_modules"]},
+                                      capabilities)
+        self.assertNotIn(str(project / "node_modules"), plain["read"])
+        self.assertIn(str(project / "node_modules"), linked["read"])
+        self.assertNotIn(str(project), linked["read"])
+
+    def test_brought_in_content_never_carries_credential_names(self):
+        for name in (".pypirc", ".git-credentials", ".docker", "id.pem", ".env.local", "auth.json", ".netrc"):
+            with self.subTest(name=name):
+                self.assertFalse(workspace.mountable(name))
+                self.assertFalse(workspace.mountable(f"config/{name}"))
+        self.assertTrue(workspace.mountable("node_modules"))
+        project, work = self.root / "plain", self.root / "plainwork"
+        (project / "node_modules/pkg").mkdir(parents=True)
+        (project / "node_modules/pkg/.env").write_text("SECRET=1\n")
+        (project / "node_modules/pkg/keys").mkdir()
+        (project / "node_modules/pkg/keys/server.pem").write_text("key\n")
+        (project / "node_modules/pkg/index.js").write_text("ok\n")
+        work.mkdir()
+        task = {"baseline": {"root": str(project), "git": False}}
+        links, brought = workspace.mount_ignored(task, work)
+        self.assertEqual((links, brought), ([], ["node_modules"]))
+        self.assertEqual((work / "node_modules/pkg/index.js").read_text(), "ok\n")
+        self.assertFalse(os.path.lexists(work / "node_modules/pkg/.env"))
+        self.assertFalse(os.path.lexists(work / "node_modules/pkg/keys/server.pem"))
+        self.assertTrue((project / "node_modules/pkg/.env").is_file())
+        other = self.root / "linkwork"
+        other.mkdir()
+        # A link would expose the whole directory, so a directory holding such a file is not linked.
+        self.assertEqual(workspace.mount_ignored(task, other, cloning=False), ([], []))
+        self.assertFalse(os.path.lexists(other / "node_modules"))
+
+    def test_deletion_outside_the_workspace_is_irreversible_even_in_granted_directories(self):
+        granted = self.root / "export"
+        granted.mkdir()
+        self.assertEqual(self.classify(f"rm {granted}/old.png"), "irreversible")
+        secrets = access.credential_roots(self.store)
+        self.assertEqual(access.classify_changes([{"path": str(granted / "old.png"), "kind": "delete"}],
+                                                 secrets=secrets, writable=[str(self.work)])[0], "irreversible")
 
     def test_directory_grants_around_credentials_are_refused(self):
         secrets = access.credential_roots(self.store)
@@ -316,6 +360,9 @@ class OpenTierTest(unittest.TestCase):
                                    {"decision": "decline"}])
         denied = [event for kind, event in self.events("secret") if kind == "approval_denied_by_floor"]
         self.assertEqual(len(denied), 3)
+        report = json.loads(Path(status["report_path"]).read_text())
+        self.assertEqual([(row["behavior"], row["by"], row["floor"]) for row in report["approvals"]],
+                         [("deny", "floor", "credential")] * 3)
         self.assertEqual(denied[0]["floor"], "credential")
         self.assertIn(".ssh/id_ed25519", denied[0]["command"])
         self.assertTrue((self.store.instance_dir("codex1") / "cli" / "fixture-steers").exists())
@@ -349,7 +396,16 @@ class OpenTierTest(unittest.TestCase):
         self.assertEqual([entry["result"]["decision"] for entry in self.approvals()], ["decline", "decline"])
         self.assertIn("approval_repeat_denied", [kind for kind, _ in self.events("deny")])
         report = json.loads(Path(status["report_path"]).read_text())
-        self.assertEqual(len(report["approvals"]), 1)
+        self.assertEqual([(row["behavior"], row["by"]) for row in report["approvals"]],
+                         [("deny", "planner"), ("deny", "repeat")])
+        # A resumed run inherits the denial, and its report still lists the earlier run's requests.
+        self.cli("task", "review", "request-changes", "deny", "--revision", status["report"], "--note", "继续")
+        self.cli("task", "resume", "deny")
+        self.launch()
+        resumed = self.wait("deny", {"review"})
+        rows = json.loads(Path(resumed["report_path"]).read_text())["approvals"]
+        self.assertEqual([row["by"] for row in rows], ["planner", "repeat", "repeat", "repeat"])
+        self.assertEqual(len({row["run"] for row in rows}), 2)
 
     def test_expired_request_counts_as_denied(self):
         self.submit("slow", "codex1", "approve-command npm install", "--approval-timeout", "1")
@@ -442,17 +498,35 @@ class OpenTierTest(unittest.TestCase):
         attempt = {"id": "attempt"}
         data = workspace.setup(directory, directory / "baseline.git", task, attempt, [])
         repo, work = Path(data["repo"]), Path(data["work"])
-        mounts = workspace.mount_ignored(task, work, cloning=False)
-        self.assertEqual(sorted(mounts), ["art/views", "node_modules"])
+        mounts, brought = workspace.mount_ignored(task, work, cloning=False)
+        self.assertEqual((sorted(mounts), sorted(brought)), (["art/views", "node_modules"],) * 2)
         self.assertEqual(os.path.realpath(work / "art/views"), str(self.project / "art/views"))
         workspace.register_mounts(repo, mounts)
         # `views/` names a directory, not a link: only the registration keeps the link out.
         commit = workspace.snapshot(repo, work, data["base"])
         self.assertEqual(commit, data["base"])
-        self.assertEqual(workspace.mount_ignored(task, work, mounts, cloning=False), mounts)
+        self.assertEqual(workspace.mount_ignored(task, work, mounts, cloning=False), (mounts, []))
         (work / "change.txt").write_text("edited\n")
         commit = workspace.snapshot(repo, work, data["base"])
         self.assertEqual(workspace.changes({"repo": str(repo), "base": data["base"]}, commit), ["change.txt"])
+
+    def test_content_ignored_only_by_the_original_repository_stays_out_of_checkpoints(self):
+        (self.project / ".git/info").mkdir(exist_ok=True)
+        (self.project / ".git/info/exclude").write_text("local-assets/\n")
+        (self.project / "local-assets").mkdir()
+        (self.project / "local-assets/big.bin").write_text("data\n")
+        self.submit("local", "codex1", "require local-assets/big.bin data\nedit change.txt done")
+        self.launch()
+        status = self.wait("local", {"review"})
+        attempt = status["attempts"][-1]
+        self.assertEqual(attempt["imported"], ["local-assets"])
+        self.assertEqual(attempt["paths"], ["change.txt"])
+        self.assertNotIn("local-assets", Path(status["patch_path"]).read_text())
+        # Still excluded after a resumed run re-registers what was brought in.
+        self.cli("task", "review", "request-changes", "local", "--revision", status["report"], "--note", "继续")
+        self.cli("task", "resume", "local")
+        self.launch()
+        self.assertEqual(self.wait("local", {"review"})["attempts"][-1]["paths"], ["change.txt"])
 
     def test_resume_tolerates_ignored_files_added_by_the_planner(self):
         (self.project / ".gitignore").write_text("shots/\nquick*.json\n")
@@ -492,7 +566,14 @@ class OpenTierTest(unittest.TestCase):
         self.cli("task", "review", "request-changes", "plain", "--revision", status["report"], "--note", "继续")
         self.cli("task", "resume", "plain")
         self.launch()
-        self.wait("plain", {"review"})
+        resumed = self.wait("plain", {"review"})
+        # quick1.json is now part of the checkpoint: changing it behind the worker is a deviation.
+        (work / "quick1.json").write_text('{"edited": true}')
+        self.cli("task", "review", "request-changes", "plain", "--revision", resumed["report"], "--note", "再来")
+        self.cli("task", "resume", "plain")
+        self.launch()
+        failed = self.wait("plain", {"failed"})
+        self.assertIn("quick1.json", json.loads(Path(failed["report_path"]).read_text())["diagnostic"])
 
     def test_generated_image_in_a_code_task_is_an_artifact(self):
         target = self.root / "export"

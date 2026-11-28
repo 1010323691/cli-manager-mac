@@ -18,7 +18,7 @@ python3 "$R" task status patch
 python3 "$R" task review approve patch --revision "$REPORT_REVISION"
 ```
 
-1. `task status` 返回尝试和 `report_path`、`summary_path`、`patch_path`。核对报告中子代理自述、变更路径、检查点提交、依赖版本、验证结果及实际补丁。报告的 `capabilities` 是这次尝试实际生效的档位、网络和读写目录，`approvals` 列出每条越界请求的命令、路径、网络目标和批复结果。代码任务里用自带生图产生的图片列在 `artifacts`（`kind` 为 `generated_image`），`path` 是控制器保存的副本，`copies` 是子代理放在工作树改动路径或 `--write-dir` 里的同内容文件。取当前报告文件的完整 `revision` 作为审核参数。
+1. `task status` 返回尝试和 `report_path`、`summary_path`、`patch_path`。核对报告中子代理自述、变更路径、检查点提交、依赖版本、验证结果及实际补丁。报告的 `capabilities` 是这次尝试实际生效的档位、网络和读写目录，`approvals` 按顺序列出本次尝试所有运行（含续跑前）的每条越界请求：命令、路径、网络目标、结果，以及由谁决定（`planner` 主会话、`floor` 安全底线、`repeat` 重复请求、`auto` full 档自动批准、`timeout` 到期）。代码任务里用自带生图产生的图片列在 `artifacts`（`kind` 为 `generated_image`），`path` 是控制器保存的副本，`copies` 是子代理放在工作树改动路径或 `--write-dir` 里的同内容文件。取当前报告文件的完整 `revision` 作为审核参数。
 2. `approve` 验证报告和补丁摘要，再运行提交时指定的 `--verify`。验证用临时副本和本机 Codex 沙箱，与任务的能力档位无关：它始终禁网，副本里没有被忽略的内容，依赖 `node_modules` 的检查应由子代理在任务中运行并写入报告。控制器优先使用已登记的第一个 Codex 实例所配置的 CLI，否则从 `PATH` 查找。验证环境使用临时主目录。返回结果的 `approved` 才是应用或生图导出所用的摘要。即使未配置验证，报告也会加入 `not_configured` 后生成审核版本。
 3. 验证失败时查看 `review_candidate` 和最新报告的 `verification`，任务不会进入已批准状态。命令退出成功只表示这次审核操作返回了结果，仍需检查 `state` 与 `approved`。缺少有效结构化报告时先补齐。选择退回修改时，指定当前报告版本和 `--note`，再用 [续跑或重试](handoff.md#续跑重试和等待额度) 继续。
 

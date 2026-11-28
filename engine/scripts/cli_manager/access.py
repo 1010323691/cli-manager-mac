@@ -238,20 +238,16 @@ def environment_roots(cache):
     return roots
 
 
-def read_roots(store, task, capabilities, own=None, *, project=False):
+def read_roots(store, task, capabilities, own=None):
     """Default and requested read-only directories, resolved, minus credential locations.
 
-    The original project is included only when `project` is set: its ignored content is normally
-    cloned into the workspace, and the project directory itself may hold `.env` files and keys
-    that a workspace never receives. It is needed, read-only, when links point back into it.
+    The original project is not among them: its ignored content is brought into the workspace,
+    and the project directory itself may hold `.env` files and keys a workspace never receives.
     """
     if not is_open(capabilities):
         return []
     base = home()
     candidates = []
-    root = (task.get("baseline") or {}).get("root")
-    if root and project:
-        candidates.append(root)
     skills = base / ".claude" / "skills"
     if skills.is_dir():
         candidates.append(skills)

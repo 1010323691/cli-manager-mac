@@ -845,10 +845,12 @@ def run_native(store, instance, task, attempt, directory, cancel):
             raise DelegateError(f"原生续跑的工作目录已偏离检查点（受控文件：{listed}）")
     if (task["kind"] != "image" and instance["provider"] == "codex" and access.is_open(access.of(task))
             and (data.get("work") or attempt.get("work"))):
-        data["mounts"] = workspace.mount_ignored(task, Path(data.get("work") or attempt["work"]),
-                                                 attempt.get("mounts") or ())
+        data["mounts"], brought = workspace.mount_ignored(task, Path(data.get("work") or attempt["work"]),
+                                                          attempt.get("mounts") or ())
+        # Everything ever brought into this workspace stays excluded, across resumed runs too.
+        data["imported"] = sorted({*(attempt.get("imported") or ()), *brought})
         if task["baseline"]["git"]:
-            workspace.register_mounts(Path(data.get("repo") or attempt["repo"]), data["mounts"])
+            workspace.register_mounts(Path(data.get("repo") or attempt["repo"]), data["imported"])
     attempt.update(data)
     with store.transaction():
         row = store.get("attempts", attempt["id"])
@@ -1043,22 +1045,29 @@ def finish(store, task, attempt, result, prepared=None):
 
 
 def approval_summary(attempt):
-    """Requests of the attempt's current run and how each was settled."""
+    """Every request of every run of the attempt, in order, and how each was settled.
+
+    Includes the ones the controller settled itself: floor refusals, repeats of a denied request
+    and automatic approvals of the `full` tier.
+    """
     rows = []
     if not attempt.get("logs"):
         return rows
-    folder = Path(attempt["logs"]) / "approvals"
-    for request_file in sorted(folder.glob("*.request.json")):
+    files = sorted(Path(attempt["logs"]).parent.glob("*/approvals/*.request.json"),
+                   key=lambda path: (path.stat().st_mtime, path.name))
+    for request_file in files:
         key = request_file.name.replace(".request.json", "")
+        decision_file = request_file.with_name(f"{key}.decision.json")
         try:
             request = read(request_file)
-            decision = read(folder / f"{key}.decision.json") if (folder / f"{key}.decision.json").is_file() else {}
+            decision = read(decision_file) if decision_file.is_file() else {}
         except (OSError, ValueError):
             continue
         inputs = request.get("input") or {}
-        rows.append({"request": key, "kind": request.get("kind"), "floor": request.get("floor"),
-                     "command": inputs.get("command"), "cwd": inputs.get("cwd"), "paths": inputs.get("paths"),
-                     "network": inputs.get("network"), "behavior": decision.get("behavior") or "unanswered",
+        rows.append({"request": key, "run": request_file.parent.parent.name, "kind": request.get("kind"),
+                     "floor": request.get("floor"), "command": inputs.get("command"), "cwd": inputs.get("cwd"),
+                     "paths": inputs.get("paths"), "network": inputs.get("network"),
+                     "behavior": decision.get("behavior") or "unanswered",
                      "always": bool(decision.get("always")), "by": decision.get("by")})
     return rows
 
@@ -1169,6 +1178,8 @@ def decide(store, name, request_id, action, answers, message, always=False):
             decision = {"behavior": "allow", "updatedInput": inputs}
         else:
             decision = {"behavior": "deny", "message": message or "主会话拒绝此请求"}
+            if native:
+                decision["by"] = "planner"
         write_json(folder / f"{request_id}.decision.json", decision)
         detail = {"always": True} if always else {}
         if native:

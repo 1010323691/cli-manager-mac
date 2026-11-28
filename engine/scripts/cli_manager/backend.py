@@ -457,8 +457,14 @@ def codex_grants(store, instance, task, attempt, capabilities):
         return None
     base = store.instance_dir(instance["id"])
     home, cache = base / "home", base / "cache"
-    # Links (the cross-volume fallback for ignored content) point into the original project.
-    read = access.read_roots(store, task, capabilities, own=base, project=bool(attempt.get("mounts")))
+    read = access.read_roots(store, task, capabilities, own=base)
+    # Links (the cross-volume fallback for ignored content) point into the original project:
+    # grant those targets only, never the project directory, which may hold `.env` files and keys.
+    root = (task.get("baseline") or {}).get("root")
+    for name in attempt.get("mounts") or () if root else ():
+        target = os.path.realpath(Path(root) / name)
+        if target not in read:
+            read.append(target)
     images = base / "cli" / "generated_images"
     images.mkdir(mode=0o700, parents=True, exist_ok=True)
     skills = base / "cli" / "skills"  # Codex's bundled skill instructions (e.g. image generation)
@@ -645,7 +651,9 @@ class CodexGate:
         self.directory, self.cancel, self.env = directory, cancel, env
         self.capabilities = grants["capabilities"]
         self.secrets = access.credential_roots(store, own=store.instance_dir(attempt["instance"]))
-        self.writable = [attempt["work"], env["TMPDIR"], *grants["write"]]
+        # Deleting anything outside the task workspace is approved one request at a time, even
+        # inside the temporary directory or a granted write directory.
+        self.writable = [attempt["work"]]
         self.items, self.steer = {}, None
         self.denied = self.previous_denials()
 
@@ -666,6 +674,15 @@ class CodexGate:
     def event(self, kind, **fields):
         with StoreConnection(self.store) as state:
             state.event(self.task["id"], kind, attempt=self.attempt["id"], **fields)
+
+    def settle(self, request, behavior, by):
+        """Record a request the controller answered itself, so reports list it like any other."""
+        import secrets
+        key = secrets.token_hex(6)
+        approvals = self.directory / "approvals"
+        # Decision first: a request file without one would read as pending.
+        write_json(approvals / f"{key}.decision.json", {"behavior": behavior, "by": by})
+        write_json(approvals / f"{key}.request.json", {**request, "id": key})
 
     def remember(self, item):
         if item.get("id"):
@@ -726,19 +743,22 @@ class CodexGate:
         mark = fingerprint(kind, *identity)
         audit = {"request_kind": kind, "floor": floor, "command": display.get("command"),
                  "cwd": display.get("cwd"), "paths": display.get("paths"), "network": display.get("network")}
-        if floor == "credential":
-            self.denied.add(mark)
-            self.event("approval_denied_by_floor", **audit)
-            return self.refuse(method, payload, "凭据访问", "安全底线禁止读写凭据路径。")
-        if mark in self.denied:
-            self.event("approval_repeat_denied", **audit)
-            return self.refuse(method, payload, "重复请求", "同一请求在本会话已被拒绝。")
-        if self.capabilities["access"] == "full" and floor is None:
-            self.event("approval_auto_allowed", **audit)
-            return self.reply(method, payload, True)
         request = {"provider": "codex", "kind": kind, "tool_name": tool, "input": display, "floor": floor,
                    "session_allow": floor is None, "fingerprint": mark,
                    "access": self.capabilities["access"]}
+        if floor == "credential":
+            self.denied.add(mark)
+            self.settle(request, "deny", "floor")
+            self.event("approval_denied_by_floor", **audit)
+            return self.refuse(method, payload, "凭据访问", "安全底线禁止读写凭据路径。")
+        if mark in self.denied:
+            self.settle(request, "deny", "repeat")
+            self.event("approval_repeat_denied", **audit)
+            return self.refuse(method, payload, "重复请求", "同一请求在本会话已被拒绝。")
+        if self.capabilities["access"] == "full" and floor is None:
+            self.settle(request, "allow", "auto")
+            self.event("approval_auto_allowed", **audit)
+            return self.reply(method, payload, True)
         decision = approval_wait(self.store, self.task, self.attempt, self.directory, request, self.cancel)
         if decision.get("behavior") == "allow":
             return self.reply(method, payload, True, bool(decision.get("always")) and floor is None)

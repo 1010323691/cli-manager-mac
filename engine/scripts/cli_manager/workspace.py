@@ -14,6 +14,7 @@ import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 
+from . import access
 from .store import DelegateError, digest, lock, write, write_json
 
 SKIP_NAMES = {".git", ".claude", ".codex", ".agents", ".ssh", ".aws", ".kube",
@@ -415,11 +416,24 @@ UNMOUNTABLE_GLOBS = (".env.*", "*.pem", "*.key", "*.p12", "*.pfx", ".cli-manager
 
 
 def mountable(relative: str) -> bool:
+    """False for tool state and for every name the approval floor treats as a credential."""
     for part in PurePosixPath(relative).parts:
         name = part.casefold()
-        if name in UNMOUNTABLE or any(fnmatch.fnmatchcase(name, pattern) for pattern in UNMOUNTABLE_GLOBS):
+        if (name in UNMOUNTABLE or name in access.SECRET_NAMES or access.SECRET_GLOBS.match(name)
+                or any(fnmatch.fnmatchcase(name, pattern) for pattern in UNMOUNTABLE_GLOBS)):
             return False
     return True
+
+
+def unmountable_inside(directory: Path):
+    """Paths under `directory` (not following links) whose own name is not mountable."""
+    found = []
+    for base, dirs, files in os.walk(directory):
+        for name in [*dirs, *files]:
+            if not mountable(name):
+                found.append(Path(base) / name)
+        dirs[:] = [name for name in dirs if mountable(name)]
+    return found
 
 
 def ignored_content(root: Path, is_git: bool):
@@ -463,20 +477,27 @@ def clone(source: Path, destination: Path) -> bool:
         return False
 
 
+LINK_LIMIT = 2000  # each link target becomes one sandbox read grant
+
+
 def mount_ignored(task: dict, work: Path, existing=(), *, cloning=True):
     """Bring the original project's ignored content into the workspace without copying it.
 
     Same-volume content is cloned copy-on-write: the worker reads the originals and may write
     beside or over them (runner output, tool caches) without touching the original project.
-    Where cloning is unavailable the path becomes a link to the original, which the sandbox
-    grants read-only. Returns the links: they are excluded from snapshots, checkpoints, patches
-    and application. Clones sit at ignored paths, which a snapshot never includes.
+    Where cloning is unavailable the path becomes a link to the original, and the sandbox is
+    granted exactly those link targets read-only. Credential-named entries never arrive: they are
+    removed from a clone, and a directory holding one is not linked.
+
+    Returns (links, brought): `brought` lists every path placed by this call. All of them are
+    registered as excluded (register_mounts), so none enters a snapshot, checkpoint or patch.
     """
     baseline = task["baseline"]
     root = Path(baseline["root"])
     mounts = [name for name in existing if (work / name).is_symlink()]
+    brought = []
     if not root.is_dir():
-        return mounts
+        return mounts, brought
     # Shallow paths first, so a dependency folder is never crowded out by thousands of files.
     for relative in sorted(ignored_content(root, baseline["git"]), key=lambda name: (name.count("/"), name)):
         if len(mounts) >= MOUNT_LIMIT:
@@ -495,16 +516,24 @@ def mount_ignored(task: dict, work: Path, existing=(), *, cloning=True):
             continue
         link.parent.mkdir(parents=True, exist_ok=True)
         if cloning and not source.is_symlink() and clone(source, link):
+            if link.is_dir():
+                for secret in unmountable_inside(link):
+                    shutil.rmtree(secret) if secret.is_dir() and not secret.is_symlink() else secret.unlink()
+            brought.append(relative)
             continue
+        if len(mounts) >= LINK_LIMIT or (source.is_dir() and not source.is_symlink() and unmountable_inside(source)):
+            continue  # a link would expose everything beneath it
         link.symlink_to(source, target_is_directory=source.is_dir())
         mounts.append(relative)
-    return mounts
+        brought.append(relative)
+    return mounts, brought
 
 
 def register_mounts(repo: Path, mounts):
-    """Keep the links out of every snapshot of a Git workspace, whatever the project's rules say.
+    """Keep brought-in content out of every snapshot of a Git workspace, whatever its rules say.
 
-    A rule such as `views/` matches a directory but not a link of the same name.
+    A rule such as `views/` matches a directory but not a link of the same name, and content the
+    original repository ignores only through its own `.git/info/exclude` has no rule here at all.
     """
     def pattern(name):
         escaped = "".join("\\" + char if char in "\\*?[" else char for char in name)
@@ -528,11 +557,16 @@ def drift(repo: Path, work: Path, attempt: dict, *, force_all: bool):
     current = snapshot(repo, work, attempt["base"], force_all=force_all, exclude=attempt.get("mounts") or ())
     if text(repo, "rev-parse", current + "^{tree}") == attempt["checkpoint_tree"]:
         return []
-    changed = names(git(repo, "diff", "--no-renames", "--name-only", "-z", attempt["checkpoint_tree"],
-                        current + "^{tree}"))
+    def differing(*selection):
+        return names(git(repo, "diff", "--no-renames", "--name-only", "-z", *selection,
+                         attempt["checkpoint_tree"], current + "^{tree}"))
+
+    changed = differing()
     # A Git snapshot already leaves ignored files out. A plain-project snapshot keeps them, so
-    # there the project's own ignore rules decide what the planning session may add between runs.
-    return sorted(set(changed) - (uncontrolled(repo, work, changed) if force_all else set()))
+    # there the project's own ignore rules forgive files added between runs. A file the
+    # checkpoint already holds is controlled: changing or deleting it is always a deviation.
+    added = differing("--diff-filter=A") if force_all else []
+    return sorted(set(changed) - uncontrolled(repo, work, added))
 
 
 def copy_non_git(source: Path, dest: Path):
