@@ -22,7 +22,7 @@ python3 "$R" queue work --parallel 4
 | `--handoff-to` | 可重复给预授权接手的实例。交接手续见 [续跑与交接](handoff.md) |
 | `--depends-on` | 可重复给已存在的同项目上游任务 ID。上游审核通过后，下游可以派发 |
 | `--include` | 可重复给 Git 根目录相对文件路径，把指定的未提交内容纳入基线。文件处理及工作目录见 [审核与应用](review-and-apply.md#工作目录与基线) |
-| `--access` | Codex 任务的能力档位，默认 `open`，见 [能力档位](#能力档位)。`sandbox` 为封闭沙箱，`full` 需要 `--confirm-full` 并由用户在交互式终端输入确认 |
+| `--access` | Codex 任务的能力档位，默认 `smart`，见 [能力档位](#能力档位)。`open` 把越界请求全部送主会话，`sandbox` 为封闭沙箱，`full` 需要 `--confirm-full` 并由用户在交互式终端输入确认 |
 | `--network` | `on`（默认，外网和本机回环）、`loopback`（只允许 127.0.0.1 / localhost）、`off`。`sandbox` 档强制 `off` |
 | `--allow-domain` | 可重复。把外网收窄为域名白名单，回环仍可用。只接受不带协议、端口和通配符的域名，且要求 `--network on` |
 | `--read-dir`、`--write-dir` | 可重复，绝对路径。追加只读或可写目录。主会话在简报里指定的工作空间用这两个参数授权。不接受根目录、整个主目录、凭据路径和调度状态目录 |
@@ -35,10 +35,10 @@ python3 "$R" queue work --parallel 4
 
 ## 能力档位
 
-档位在提交时确定，写入任务记录。`task resume`、`task retry` 和交接沿用。它适用于 Codex 实例；Claude 实例始终使用封闭沙箱，给只有 Claude 实例的任务显式传开放档选项会被拒绝。
+档位在提交时确定，写入任务记录。`task resume`、`task retry` 和交接沿用。它适用于 Codex 实例；Claude 实例始终使用封闭沙箱，给只有 Claude 实例的任务显式传 `smart`、`open` 或 `full` 档的选项会被拒绝。
 
 ```bash
-# 默认：开放档、联网、生图
+# 默认：智能档（开放档的能力，例行越界请求自动放行）、联网、生图
 python3 "$R" task submit --id model --project "$PWD" --instance codex1 --brief "$HOME/task.md"
 # 追加工作空间，外网只放行 npm
 python3 "$R" task submit --id deps --project "$PWD" --instance codex1 --brief "$HOME/task.md" \
@@ -50,14 +50,30 @@ python3 "$R" task submit --id audit --project "$PWD" --instance codex1 --brief "
 
 | 档位 | 沙箱内可做 | 越出沙箱的请求 |
 |---|---|---|
-| `open`（默认） | 读写任务工作树（含带进来的被忽略内容）和 `--write-dir`；只读 `~/.claude/skills`、`~/.cache`、`PATH` 上的工具链、系统框架与应用、`--read-dir`；按 `--network` 联网 | 作为待批请求经 `task watch` 交主会话，`task decide` 批复后按 Codex 原生审批语义执行 |
+| `smart`（默认） | 读写任务工作树（含带进来的被忽略内容）和 `--write-dir`；只读 `~/.claude/skills`、`~/.cache`、`PATH` 上的工具链、系统框架与应用、`--read-dir`；按 `--network` 联网 | 例行请求由控制器自动放行并记录；其余作为待批请求交主会话，并附上未自动放行的原因（`smart_review`）。见 [智能审批](#智能审批) |
+| `open` | 同 `smart` | 作为待批请求经 `task watch` 交主会话，`task decide` 批复后按 Codex 原生审批语义执行 |
 | `sandbox` | 只读写任务工作树，禁网，不能生图 | 控制器自动拒绝，不送主会话 |
 | `full` | 同 `open` | 自动批准，不逐条询问。不可逆操作仍交主会话，凭据仍拒绝 |
 
-- 开放档的子代理使用用户的真实 `HOME`，无头浏览器等桌面程序才能找到登录钥匙串。CLI 自身的登录仍在实例的 `CODEX_HOME`，Git 不读取用户的全局配置，npm、pip、uv 的缓存放在实例目录。`sandbox` 档和 Claude 实例使用实例独立的 `HOME`。
+- `smart`、`open` 和 `full` 档的子代理使用用户的真实 `HOME`，无头浏览器等桌面程序才能找到登录钥匙串。CLI 自身的登录仍在实例的 `CODEX_HOME`，Git 不读取用户的全局配置，npm、pip、uv 的缓存放在实例目录。`sandbox` 档和 Claude 实例使用实例独立的 `HOME`。
 - 项目里被 `.gitignore` 忽略的内容（原图、贴图、`node_modules`）在建立工作树时用 APFS 克隆带进来，不占额外空间，子代理可以在其中写运行产物，原项目不受影响。原项目主目录本身不授予沙箱：其中的 `.env`、密钥文件不会进入工作树，也不会被子代理读到。凭据类文件名（`.env`、`*.pem`、`.npmrc` 等）和 `.claude`、`.codex` 不带入，克隆目录里的这类文件会被移除；本身是符号链接的被忽略路径也不带入。带进来的内容不进快照、检查点、补丁和应用。克隆要求调度状态目录与项目在同一个 APFS 卷上；无法克隆时任务启动即失败并说明原因，可把状态目录（`CLI_MANAGER_STATE`）移到同卷，或改用 `--access sandbox`。
 - 无头浏览器和图形程序无法在沙箱内启动，子代理按规则直接为该命令申请提权。
 - `full` 没有关闭沙箱：这样凭据和不可逆操作的底线才能继续生效。它省掉的是逐条审批。
+
+### 智能审批
+
+`smart` 档的沙箱范围与 `open` 相同，区别只在越界请求由谁批。控制器先套安全底线，再判断请求是否例行。下列条件**全部**满足才自动放行，记为 `approval_smart_allowed`，报告的 `approvals` 里 `by` 为 `smart`：
+
+- 没有触及底线。凭据照旧直接拒绝，不可逆操作照旧逐条交主会话。
+- 是命令或文件修改，不是额外权限申请，命令也没有附带额外权限。
+- 网络目标为空或只有本机回环，命令文本里没有本机之外的地址。
+- 命令在任务目录内执行，点名的每个路径都在任务自己的目录（工作树、该次尝试的目录、`--write-dir`）或只读工具位置内。文件修改全部落在任务自己的目录内。
+- 命令不改动系统、不访问其他主机、不把控制交给其他程序。`sudo`、`osascript`、`launchctl`、`defaults`、`kill`、`open`、`ssh`、`curl`、`wget`、装包（`npm install`、`pip install`、`brew`、用 `npx` 调项目里没有的包等）、全局配置、命令替换和写到任务目录之外的重定向都不算例行。
+- 命令运行任务目录里的脚本时，控制器会读脚本（上限 256 KB）。含改动系统或不可逆的操作、凭据路径、本机之外的地址、`eval` 或经 shell 执行字符串的，不自动放行。
+
+其余请求送主会话，待批请求带 `smart_review` 字段说明原因，并记 `approval_smart_referred`。典型的自动放行是在任务目录里起本机开发服务器和无头浏览器做验证。典型的转交是装依赖、访问外网和动任务目录之外的文件。
+
+这是尽力而为的静态检查：脚本可以在运行时拼出检查看不到的行为。它减少的是例行请求的往返，不是隔离强度。要逐条过目用 `--access open`，要完全隔离用 `--access sandbox`。`smart` 不需要终端确认，因为它自动放行的范围由上面的条件限定，超出的仍交主会话。
 
 ### 安全底线
 
@@ -105,7 +121,7 @@ python3 "$R" task cancel patch
 
 - `task watch` 默认最多等 10 秒。出现待批请求、新事件或任务走出运行/等待状态时可以提前返回。用返回的 `since` 作下一次游标，避免反复读取旧事件。轮询时同时检查 `task.state` 和 `task.pending`。
 - 审批先读取真实请求，判断用户是否已授权。工具请求使用 `allow` 或 `deny`，提问用 `answer` 或拒绝。答案要覆盖每个问题，键可用问题 ID 或原文，值是字符串或非空字符串数组。Claude 的问题没有 ID 时用原文。凭据请走原生终端登录。
-- Claude 的工具批准受工作目录和沙箱范围约束。Codex 开放档的越界请求（`kind` 为 `command`、`file_change` 或 `permissions`）交主会话：`allow` 批准这一次，`allow --always` 让本会话同类请求放行，`deny --message` 拒绝并把理由告诉子代理。请求的 `floor` 为 `irreversible` 时 `session_allow` 是 `false`，只能逐条批准。`sandbox` 档的扩权请求由控制器拒绝。模型提问在各档位都经主会话。过期或已处理的请求无法重复批复。取消正在运行的任务会先请求停止，之后轮询状态确认完成。
+- Claude 的工具批准受工作目录和沙箱范围约束。Codex 的越界请求（`kind` 为 `command`、`file_change` 或 `permissions`）在 `open` 档全部交主会话，在 `smart` 档只有非例行的交主会话（带 `smart_review`）：`allow` 批准这一次，`allow --always` 让本会话同类请求放行，`deny --message` 拒绝并把理由告诉子代理。请求的 `floor` 为 `irreversible` 时 `session_allow` 是 `false`，只能逐条批准。`sandbox` 档的扩权请求由控制器拒绝。模型提问在各档位都经主会话。过期或已处理的请求无法重复批复。取消正在运行的任务会先请求停止，之后轮询状态确认完成。
 - 任务进入 `review` 后读取报告和实际差异。`needs_report` 需要补齐有效结构化报告。`failed`、`auth`、`timed_out` 或 `interrupted` 可从 `task status` 的尝试与报告中诊断，再选择 [续跑或重试](handoff.md)。
 
 源码对应 [入口、游标和输出](../scripts/delegate.py)、[授权与队列](../scripts/cli_manager/controller.py) 和 [额度与审批协议](../scripts/cli_manager/backend.py)。

@@ -341,7 +341,8 @@ def codex_capabilities(version, features):
     # Fixture and older listings may omit a row; only an explicit "removed" withdraws a feature.
     proxy = supported and known.get("network_proxy", True)
     image = supported and known.get("image_generation", True)
-    available = {"access.sandbox": supported, "access.open": supported, "access.full": supported,
+    available = {"access.sandbox": supported, "access.smart": supported, "access.open": supported,
+                 "access.full": supported,
                  "network.on": supported, "network.off": supported, "network.loopback": proxy,
                  "network.allow_domain": proxy, "image": image, "approvals": supported,
                  "read_dirs": supported, "write_dirs": supported}
@@ -635,7 +636,9 @@ class CodexGate:
 
     Credential access is refused outright. Irreversible actions always reach the planning session
     and can never be accepted for the whole session. In `full`, everything else is accepted
-    without asking; in `open`, it waits for `task decide`.
+    without asking; in `open`, it waits for `task decide`; in `smart`, routine requests that stay
+    inside the task's own directories and on loopback are accepted (access.smart_review) and the
+    rest waits for `task decide`.
     """
     METHODS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
                "item/permissions/requestApproval")
@@ -648,6 +651,10 @@ class CodexGate:
         # Deleting anything outside the task workspace is approved one request at a time, even
         # inside the temporary directory or a granted write directory.
         self.writable = [attempt["work"]]
+        # What `smart` treats as the task's own ground: the workspace, this attempt's directory
+        # (scratch files, logs) and the granted write directories.
+        self.own = [attempt["work"], str(Path(directory).parent.parent), *(grants.get("write") or [])]
+        self.readable = list(grants.get("read") or [])
         self.items, self.steer = {}, None
         self.denied = self.previous_denials()
 
@@ -753,6 +760,16 @@ class CodexGate:
             self.settle(request, "allow", "auto")
             self.event("approval_auto_allowed", **audit)
             return self.reply(method, payload, True)
+        if self.capabilities["access"] == "smart":
+            review = access.smart_review(kind, display, floor, secrets=self.secrets, own=self.own,
+                                         readable=self.readable)
+            if review is None:
+                self.settle(request, "allow", "smart")
+                self.event("approval_smart_allowed", **audit)
+                return self.reply(method, payload, True)
+            # Shown with the pending request, so the planning session sees why it was not routine.
+            request["smart_review"] = review
+            self.event("approval_smart_referred", review=review, **audit)
         decision = approval_wait(self.store, self.task, self.attempt, self.directory, request, self.cancel)
         if decision.get("behavior") == "allow":
             return self.reply(method, payload, True, bool(decision.get("always")) and floor is None)
@@ -1055,7 +1072,8 @@ def record_capabilities(store, task, attempt, capabilities, grants):
     effective = {**access.summary(capabilities),
                  "read_roots": grants["read"] if grants else [],
                  "write_roots": [attempt["work"], *(grants["write"] if grants else [])],
-                 "approvals": ("auto" if capabilities["access"] == "full" else "planner") if grants else "denied"}
+                 "approvals": ({"full": "auto", "smart": "smart"}.get(capabilities["access"], "planner")
+                               if grants else "denied")}
     if task["kind"] == "image":
         effective.update(access="sandbox", network="off", read_roots=[], image=True,
                          note="生图任务使用独立只读目录")

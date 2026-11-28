@@ -180,8 +180,9 @@ def parse(argv=None):
     add.add_argument("--parallel", type=positive)
     add.add_argument("--timeout", type=positive, default=3600)
     add.add_argument("--approval-timeout", type=positive, default=1800)
-    add.add_argument("--access", choices=("open", "sandbox", "full"),
-                     help="open（默认）：可联网、可读授权目录，越界请求送主会话审批；"
+    add.add_argument("--access", choices=("smart", "open", "sandbox", "full"),
+                     help="smart（默认）：可联网、可读授权目录，例行的越界请求由控制器自动放行，其余送主会话审批；"
+                          "open：越界请求全部送主会话审批；"
                           "sandbox：封闭沙箱；full：越界不逐条审批，需 --confirm-full 并在终端确认")
     add.add_argument("--network", choices=("on", "loopback", "off"), help="默认 on；sandbox 档强制 off")
     add.add_argument("--allow-domain", action="append", default=[], help="把外网收窄为域名白名单，可重复")
