@@ -401,8 +401,12 @@ def script_review(text, *, secrets):
             return f"脚本访问本机之外的地址：{host}"
     for name in re.findall(r"[\w.~/-]+", text):
         part = Path(name).name
-        if part.casefold() in SECRET_NAMES or SECRET_GLOBS.match(part):
-            return f"脚本提到凭据路径：{part}"
+        # Bare words in code (`event.key`, `cert.pem` as a property) are not paths: the extension
+        # patterns only count for something written as a path. Credential names count anywhere.
+        pathlike = "/" in name or name.startswith("~")
+        segments_ = Path(name).parts if pathlike else (part,)
+        if any(seg.casefold() in SECRET_NAMES for seg in segments_) or (pathlike and SECRET_GLOBS.match(part)):
+            return f"脚本提到凭据路径：{name}"
     return None
 
 
