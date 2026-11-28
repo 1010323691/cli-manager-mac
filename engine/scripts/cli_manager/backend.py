@@ -461,9 +461,12 @@ def codex_grants(store, instance, task, attempt, capabilities):
     # Links (the cross-volume fallback for ignored content) point into the original project:
     # grant those targets only, never the project directory, which may hold `.env` files and keys.
     root = (task.get("baseline") or {}).get("root")
+    secrets = access.credential_roots(store, own=base)
     for name in attempt.get("mounts") or () if root else ():
         target = os.path.realpath(Path(root) / name)
-        if target not in read:
+        # Checked on every run: the grant must stay inside the project and clear of credentials.
+        if (target not in read and Path(target).is_relative_to(os.path.realpath(root))
+                and not access.grants_secret(target, secrets)):
             read.append(target)
     images = base / "cli" / "generated_images"
     images.mkdir(mode=0o700, parents=True, exist_ok=True)

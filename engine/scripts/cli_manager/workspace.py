@@ -408,7 +408,6 @@ def snapshot(repo: Path, work: Path, parent: str | None, *, include=(), force_al
     return commit
 
 
-MOUNT_LIMIT = 20000
 # Never linked into a workspace, even when the project ignores them.
 UNMOUNTABLE = {".git", ".claude", ".codex", ".agents", ".ssh", ".aws", ".kube", ".cli-delegate-v2",
                ".mcp.json", ".credentials.json", "auth.json", ".netrc", ".npmrc", ".env", ".gnupg"}
@@ -455,7 +454,7 @@ def ignored_content(root: Path, is_git: bool):
                     found.append(name)
                 else:
                     deeper.extend(f"{name}/{child}" for child in sorted(os.listdir(path)))
-            pending = deeper[:MOUNT_LIMIT * 4]
+            pending = deeper
         return list(dict.fromkeys(found))
     found = []
     for base, dirs, _ in os.walk(root):
@@ -477,7 +476,27 @@ def clone(source: Path, destination: Path) -> bool:
         return False
 
 
-LINK_LIMIT = 2000  # each link target becomes one sandbox read grant
+LINK_LIMIT = 4000  # each link target becomes one sandbox read grant
+
+
+def link_filtered(source: Path, link: Path, relative: str, mounts: list):
+    """Link `source` at `link`, or, when it holds credential-named entries, only its safe children.
+
+    A link exposes everything beneath its target, so a directory with such an entry becomes a
+    real directory whose remaining children are linked one by one. Links inside it are skipped.
+    """
+    if source.is_dir() and unmountable_inside(source):
+        link.mkdir(exist_ok=True)
+        for child in sorted(os.listdir(source)):
+            if mountable(child) and not (source / child).is_symlink() and not os.path.lexists(link / child):
+                link_filtered(source / child, link / child, f"{relative}/{child}", mounts)
+        return
+    if len(mounts) >= LINK_LIMIT:
+        raise DelegateError(
+            f"原项目被忽略的内容无法克隆，需要的只读链接超过 {LINK_LIMIT} 个，无法完整带入工作树；"
+            "请把调度状态目录放在与项目相同的卷上，或用 --access sandbox 提交")
+    link.symlink_to(source, target_is_directory=source.is_dir())
+    mounts.append(relative)
 
 
 def mount_ignored(task: dict, work: Path, existing=(), *, cloning=True):
@@ -487,7 +506,8 @@ def mount_ignored(task: dict, work: Path, existing=(), *, cloning=True):
     beside or over them (runner output, tool caches) without touching the original project.
     Where cloning is unavailable the path becomes a link to the original, and the sandbox is
     granted exactly those link targets read-only. Credential-named entries never arrive: they are
-    removed from a clone, and a directory holding one is not linked.
+    removed from a clone, and a directory holding one is rebuilt from links to its other children.
+    Too many links to grant is an error, never a silently incomplete workspace.
 
     Returns (links, brought): `brought` lists every path placed by this call. All of them are
     registered as excluded (register_mounts), so none enters a snapshot, checkpoint or patch.
@@ -500,11 +520,10 @@ def mount_ignored(task: dict, work: Path, existing=(), *, cloning=True):
         return mounts, brought
     # Shallow paths first, so a dependency folder is never crowded out by thousands of files.
     for relative in sorted(ignored_content(root, baseline["git"]), key=lambda name: (name.count("/"), name)):
-        if len(mounts) >= MOUNT_LIMIT:
-            break
         source, link = root / relative, work / relative
+        # An ignored path that is itself a link may lead anywhere: it is never brought in.
         if (not relative or not mountable(relative) or relative in mounts or not os.path.lexists(source)
-                or any(relative.startswith(mount + "/") for mount in mounts)):
+                or source.is_symlink() or any(relative.startswith(mount + "/") for mount in mounts)):
             continue
         parent = work
         for part in PurePosixPath(relative).parts[:-1]:
@@ -515,16 +534,13 @@ def mount_ignored(task: dict, work: Path, existing=(), *, cloning=True):
         if parent is None or os.path.lexists(link):
             continue
         link.parent.mkdir(parents=True, exist_ok=True)
-        if cloning and not source.is_symlink() and clone(source, link):
+        if cloning and clone(source, link):
             if link.is_dir():
                 for secret in unmountable_inside(link):
                     shutil.rmtree(secret) if secret.is_dir() and not secret.is_symlink() else secret.unlink()
             brought.append(relative)
             continue
-        if len(mounts) >= LINK_LIMIT or (source.is_dir() and not source.is_symlink() and unmountable_inside(source)):
-            continue  # a link would expose everything beneath it
-        link.symlink_to(source, target_is_directory=source.is_dir())
-        mounts.append(relative)
+        link_filtered(source, link, relative, mounts)
         brought.append(relative)
     return mounts, brought
 

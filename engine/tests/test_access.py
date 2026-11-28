@@ -219,9 +219,40 @@ class PolicyTest(unittest.TestCase):
         self.assertTrue((project / "node_modules/pkg/.env").is_file())
         other = self.root / "linkwork"
         other.mkdir()
-        # A link would expose the whole directory, so a directory holding such a file is not linked.
-        self.assertEqual(workspace.mount_ignored(task, other, cloning=False), ([], []))
-        self.assertFalse(os.path.lexists(other / "node_modules"))
+        # A link exposes everything beneath it: a mixed directory is rebuilt from its safe children.
+        links, brought = workspace.mount_ignored(task, other, cloning=False)
+        self.assertEqual((links, brought), (["node_modules/pkg/index.js"], ["node_modules"]))
+        self.assertFalse((other / "node_modules/pkg").is_symlink())
+        self.assertEqual((other / "node_modules/pkg/index.js").read_text(), "ok\n")
+        self.assertFalse(os.path.lexists(other / "node_modules/pkg/.env"))
+        self.assertEqual(os.listdir(other / "node_modules/pkg/keys"), [])
+        self.assertEqual(workspace.mount_ignored(task, other, links, cloning=False), (links, []))
+
+    def test_too_many_links_is_an_error_not_a_partial_workspace(self):
+        project, work = self.root / "many", self.root / "manywork"
+        for name in ("node_modules", ".venv"):
+            (project / name).mkdir(parents=True)
+        work.mkdir()
+        task = {"baseline": {"root": str(project), "git": False}}
+        with patch.object(workspace, "LINK_LIMIT", 1), self.assertRaises(DelegateError):
+            workspace.mount_ignored(task, work, cloning=False)
+
+    def test_ignored_links_are_not_brought_in_and_grants_stay_inside_the_project(self):
+        project, work, outside = self.root / "linked", self.root / "linkedwork", self.root / "outside"
+        project.mkdir()
+        outside.mkdir()
+        (project / "node_modules").symlink_to(outside, target_is_directory=True)
+        work.mkdir()
+        task = {"kind": "code", "baseline": {"root": str(project), "git": False}}
+        for cloning in (True, False):
+            self.assertEqual(workspace.mount_ignored(task, work, cloning=cloning), ([], []))
+        self.assertFalse(os.path.lexists(work / "node_modules"))
+        # Even a recorded mount is not granted when it resolves outside the project.
+        instance = {"id": "one", "provider": "codex"}
+        backend.environment(self.store, instance)
+        grants = backend.codex_grants(self.store, instance, task, {"instance": "one", "mounts": ["node_modules"]},
+                                      access.normalize(self.store, None))
+        self.assertNotIn(str(outside), grants["read"])
 
     def test_deletion_outside_the_workspace_is_irreversible_even_in_granted_directories(self):
         granted = self.root / "export"
