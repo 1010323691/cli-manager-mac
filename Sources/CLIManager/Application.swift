@@ -198,6 +198,7 @@ private final class ApplicationController: NSObject, NSApplicationDelegate {
             for (phase, title, expected) in [
                 ("empty", "activity-empty-initial", []),
                 ("active", "activity-two", ["review-interface", "audit-bridge"]),
+                ("many", "activity-four", ["test-output", "scan-project", "review-interface", "audit-bridge"]),
                 ("one", "activity-one", ["audit-bridge"]),
                 ("empty", "activity-empty", []),
             ] {
@@ -206,6 +207,7 @@ private final class ApplicationController: NSObject, NSApplicationDelegate {
                 try await waitForFixture("automatic snapshot \(title)", seconds: 12) {
                     (self.dashboard.snapshot?.snapshotAt ?? 0) > previous && self.dashboard.liveAttempts.map(\.taskID) == expected
                 }
+                try edge.verifyAutomaticActivityFixture(isHeld: !expected.isEmpty)
                 if phase == "active" {
                     VisualEvidence.frames.removeValue(forKey: "managed-output")
                     dashboard.choose("codex-active")
@@ -232,9 +234,14 @@ private final class ApplicationController: NSObject, NSApplicationDelegate {
                         throw VisualEvidence.failure("Selection changed activity")
                     }
                     _ = try await edge.captureActivityFixture(to: directory.appendingPathComponent("activity-two-after-selection.png"))
+                    edge.dismissActivityFixture()
+                    await dashboard.refresh()
+                    try edge.verifyAutomaticActivityFixture(isHeld: false)
+                } else if expected.isEmpty {
+                    edge.dismissActivityFixture()
                 }
             }
-            try Data("Stable native coordinates. Automatic activity 0 → 2 → 1 → 0; selection-independent.\n".utf8)
+            try Data("Stable native coordinates. Automatic activity 0 → 2 → 4 → 1 → 0; closes at zero.\n".utf8)
                 .write(to: directory.appendingPathComponent("activity-result"), options: .atomic)
         } catch {
             try? Data(error.localizedDescription.utf8).write(to: directory.appendingPathComponent("activity-result"), options: .atomic)

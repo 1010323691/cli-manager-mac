@@ -11,12 +11,13 @@ from seed_status_ui import seed, controller, Store
 
 
 def add_activity(store, pid, phase):
-    tasks = [("audit-bridge", "codex-active"), ("review-interface", "codex-idle")]
+    tasks = [("audit-bridge", "codex-active"), ("review-interface", "codex-idle"),
+             ("scan-project", "codex-active"), ("test-output", "codex-idle")]
     stamp = time.time()
     with store.transaction():
         for index, (task, instance) in enumerate(tasks):
             attempt = f"fixture-attempt-{task}"
-            verified = phase == "active" or phase == "one" and index == 0
+            verified = index < {"empty": 0, "one": 1, "active": 2, "many": 4}[phase]
             state = ("running" if index == 0 else "stopping") if verified else "review"
             store.put("tasks", {"id": task, "state": state, "kind": "review",
                                 "allowed": [instance], "attempt": attempt})
@@ -78,7 +79,7 @@ def main():
                 command += ["--capture-activity-fixture", str(evidence)]
             subprocess.run(command, env=env, check=True, timeout=15)
             if options.manual:
-                (state / "activity-phase").write_text("active")
+                (state / "activity-phase").write_text("many")
             deadline = time.monotonic() + (130 if options.manual else 70)
             last = None
             while time.monotonic() < deadline:
@@ -90,7 +91,7 @@ def main():
                     return
                 request = state / "activity-phase"
                 if request.exists() and (phase := request.read_text()) != last:
-                    if phase in {"active", "one", "empty"}:
+                    if phase in {"active", "many", "one", "empty"}:
                         store = Store(state)
                         try:
                             add_activity(store, worker.pid, phase)

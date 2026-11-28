@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @MainActor
@@ -50,7 +51,7 @@ private struct PeekView: View {
 
     private var pane: some View {
         let attempts = dashboard.liveAttempts
-        return VStack(alignment: .leading, spacing: 9) {
+        return VStack(alignment: .leading, spacing: EdgeGeometry.contentSpacing) {
             HStack(spacing: 8) {
                 Image(systemName: "waveform.path")
                     .foregroundStyle(accent)
@@ -62,19 +63,11 @@ private struct PeekView: View {
                     .font(.system(size: 15, weight: .semibold))
                     .accessibilityAddTraits(.isHeader)
                 Spacer(minLength: 2)
-                if dashboard.snapshotError == nil, dashboard.queueCount > 0 {
-                    Label("排队 \(dashboard.queueCount)", systemImage: "clock")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(muted)
-                        .lineLimit(1)
-                        .accessibilityLabel("\(dashboard.queueCount) 个任务排队中")
-                }
-                if attempts.count > 3 {
-                    Text("+\(attempts.count - 3)")
+                if attempts.count > EdgeGeometry.visibleActivityRows {
+                    Text("\(attempts.count) 项")
                         .font(.caption.weight(.medium).monospacedDigit())
-                        .padding(.horizontal, 3)
-                        .help("还有 \(attempts.count - 3) 个活动任务")
-                        .accessibilityLabel("还有 \(attempts.count - 3) 个活动任务")
+                        .foregroundStyle(muted)
+                        .accessibilityLabel("\(attempts.count) 个活动任务")
                 }
                 toolButton(state.isPinned ? "pin.fill" : "pin", state.isPinned ? "取消固定" : "固定摘要",
                            selected: state.isPinned) {
@@ -83,11 +76,15 @@ private struct PeekView: View {
                 .keyboardShortcut("p", modifiers: [])
                 toolButton("xmark", "收起摘要", action: close)
             }
+            .frame(height: EdgeGeometry.headerHeight)
             Group {
-                if !attempts.isEmpty {
-                    VStack(spacing: 4) {
-                        ForEach(attempts.prefix(3)) { attempt in activityRow(attempt) }
+                if attempts.count > EdgeGeometry.visibleActivityRows {
+                    ScrollView {
+                        activityRows(attempts)
                     }
+                    .accessibilityIdentifier("edge-activity-list")
+                } else if !attempts.isEmpty {
+                    activityRows(attempts)
                     .frame(maxHeight: .infinity, alignment: .top)
                 } else if dashboard.snapshotError != nil {
                     activityPlaceholder("本地状态读取失败", icon: "exclamationmark.triangle", color: legible(.orange, in: .light))
@@ -97,11 +94,11 @@ private struct PeekView: View {
                     activityPlaceholder("暂无运行中的任务", icon: "tray", color: muted)
                 }
             }
-            .frame(height: 109)
+            .frame(height: EdgeGeometry.activityHeight)
         }
         .padding(.horizontal, 16)
         .padding(.top, topInset)
-        .padding(.bottom, 13)
+        .padding(.bottom, EdgeGeometry.bottomInset)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .foregroundStyle(ink, muted)
         .modifier(PeekMaterial(shape: shape, paper: paper, opaque: opaque))
@@ -110,6 +107,12 @@ private struct PeekView: View {
             shape.strokeBorder(.linearGradient(colors: [.white.opacity(0.95), edge],
                                                startPoint: .top, endPoint: .bottom), lineWidth: 1)
                 .allowsHitTesting(false)
+        }
+    }
+
+    private func activityRows(_ attempts: [LiveAttempt]) -> some View {
+        LazyVStack(spacing: EdgeGeometry.activityRowSpacing) {
+            ForEach(attempts) { activityRow($0) }
         }
     }
 
@@ -134,7 +137,7 @@ private struct PeekView: View {
                 .fixedSize()
         }
         .padding(.horizontal, 8)
-        .frame(height: 33)
+        .frame(height: EdgeGeometry.activityRowHeight)
         .background(ink.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
         .help("\(attempt.taskID) · \(attempt.instance) · \(badge.title)")
         .accessibilityElement(children: .combine)
@@ -239,8 +242,20 @@ final class EdgeController {
     private let onManage: () -> Void
     private var windows: [CGDirectDisplayID: ScreenPeek] = [:]
     private var timer: Timer?
+    private var snapshotObserver: AnyCancellable?
+    private var previousAttemptIDs: Set<String> = []
+    // Hold the request while all displays temporarily hide their menu bars.
+    private var holdsActivity = false
+    private var activityDisplay: CGDirectDisplayID?
     var enabled = true {
-        didSet { if enabled != oldValue { rebuild() } }
+        didSet {
+            guard enabled != oldValue else { return }
+            if !enabled {
+                holdsActivity = false
+                activityDisplay = nil
+            }
+            rebuild()
+        }
     }
 
     init(model: Dashboard, onManage: @escaping () -> Void) {
@@ -250,6 +265,9 @@ final class EdgeController {
 
     func start() {
         rebuild()
+        snapshotObserver = model.$snapshot.sink { [weak self] snapshot in
+            self?.observeActivity(snapshot)
+        }
         let timer = Timer(timeInterval: 0.055, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
@@ -260,6 +278,7 @@ final class EdgeController {
     func stop() {
         timer?.invalidate()
         timer = nil
+        snapshotObserver = nil
         windows.values.forEach { $0.panel.orderOut(nil) }
         windows.removeAll()
     }
@@ -288,7 +307,7 @@ final class EdgeController {
             panel.level = .statusBar
             let state = PeekState()
             let peek = ScreenPeek(panel: panel, state: state, geometry: geometry)
-            let dismiss = { [weak peek] in peek?.collapse() ?? () }
+            let dismiss = { [weak self] in self?.dismiss(id) ?? () }
             let content = PeekView(dashboard: model, state: state, topInset: geometry.contentTopInset,
                                    close: dismiss)
             let hosting = PeekHostingView(rootView: content)
@@ -307,7 +326,9 @@ final class EdgeController {
     }
 
     func hideSummaries() {
-        for peek in windows.values where peek.state.isOpen && !peek.state.isPinned { peek.collapse() }
+        for (id, peek) in windows where peek.state.isOpen && !peek.state.isPinned && !holdsActivity(on: id) {
+            peek.collapse()
+        }
     }
 
     func openFromMenu() {
@@ -322,6 +343,35 @@ final class EdgeController {
         peek.reveal(keyboard: true)
     }
 
+    private func observeActivity(_ snapshot: Snapshot?) {
+        guard let snapshot else { return }
+        let attempts = LiveAttempt.normalized(snapshot.liveAttempts ?? [])
+        let ids = Set(attempts.map(\.attemptID))
+        let arrived = !ids.isSubset(of: previousAttemptIDs)
+        previousAttemptIDs = ids
+        if ids.isEmpty {
+            let peek = activityDisplay.flatMap { windows[$0] }
+            holdsActivity = false
+            activityDisplay = nil
+            if let peek, !peek.state.isPinned { peek.collapse() }
+        } else if arrived && enabled {
+            holdsActivity = true
+            poll()
+        }
+    }
+
+    private func holdsActivity(on id: CGDirectDisplayID) -> Bool {
+        holdsActivity && activityDisplay == id
+    }
+
+    private func dismiss(_ id: CGDirectDisplayID) {
+        if holdsActivity(on: id) {
+            holdsActivity = false
+            activityDisplay = nil
+        }
+        windows[id]?.collapse()
+    }
+
     private func layout(for screen: NSScreen) -> EdgeGeometry {
         EdgeGeometry(screen: screen.frame, visible: screen.visibleFrame, safeTop: screen.safeAreaInsets.top)
     }
@@ -330,9 +380,20 @@ final class EdgeController {
         mouse: CGPoint = NSEvent.mouseLocation, time: TimeInterval = ProcessInfo.processInfo.systemUptime,
         pointerDown: Bool = NSEvent.pressedMouseButtons != 0
     ) {
-        for screen in NSScreen.screens {
+        let screens = NSScreen.screens
+        let available = screens.filter { layout(for: $0).menuBarVisible }
+        let displayIDs = Set(available.compactMap(\.displayID))
+        if holdsActivity {
+            if activityDisplay.map(displayIDs.contains) != true {
+                activityDisplay = (available.first { $0.frame.contains(mouse) } ?? available.first)?.displayID
+            }
+            if let activityDisplay, let peek = windows[activityDisplay], !peek.state.isOpen {
+                peek.reveal()
+            }
+        }
+        for screen in screens {
             guard let id = screen.displayID, let peek = windows[id] else { continue }
-            guard layout(for: screen).menuBarVisible, enabled || peek.state.isOpen else {
+            guard displayIDs.contains(id), enabled || peek.state.isOpen else {
                 if peek.panel.isVisible {
                     peek.collapse()
                     peek.panel.orderOut(nil)
@@ -344,22 +405,48 @@ final class EdgeController {
                 atTrigger: enabled && peek.geometry.hitsTrigger(mouse),
                 withinPanel: peek.panel.frame.insetBy(dx: -11, dy: -7).contains(mouse),
                 pointerDown: pointerDown,
-                isOpen: peek.state.isOpen, isPinned: peek.state.isPinned, now: time
+                isOpen: peek.state.isOpen, isPinned: peek.state.isPinned || holdsActivity(on: id), now: time
             )
             if decision == .open { peek.reveal() }
             if decision == .close { peek.collapse() }
         }
     }
     #if DEBUG
+    func verifyAutomaticActivityFixture(isHeld: Bool) throws {
+        guard isHeld else {
+            guard !holdsActivity, windows.values.allSatisfy({ !$0.state.isOpen }) else {
+                throw VisualEvidence.failure("Activity remained open without an automatic reveal")
+            }
+            return
+        }
+        guard holdsActivity, let activityDisplay, let peek = windows[activityDisplay],
+              peek.state.isOpen, !peek.panel.isKeyWindow else {
+            throw VisualEvidence.failure("Activity did not open without taking keyboard focus")
+        }
+        let outside = CGPoint(x: peek.geometry.panel.midX, y: peek.geometry.panel.minY - 30)
+        let time = ProcessInfo.processInfo.systemUptime
+        poll(mouse: outside, time: time, pointerDown: false)
+        poll(mouse: outside, time: time + 0.6, pointerDown: false)
+        hideSummaries()
+        guard peek.state.isOpen else { throw VisualEvidence.failure("Activity did not stay open") }
+    }
+
+    func dismissActivityFixture() {
+        if let id = activityDisplay ?? NSScreen.main?.displayID { windows[id]?.panel.dismiss?() }
+    }
+
     func captureActivityFixture(to file: URL) async throws -> CGRect {
         timer?.invalidate()
-        guard let screen = NSScreen.main, let id = screen.displayID,
+        let screen = NSScreen.screens.first { $0.displayID == activityDisplay } ?? NSScreen.main
+        guard let screen, let id = screen.displayID,
               let peek = windows[id], layout(for: screen).menuBarVisible else {
             throw VisualEvidence.failure("No display with a visible menu bar")
         }
         if !peek.state.isOpen {
             let point = CGPoint(x: peek.geometry.trigger.midX, y: peek.geometry.trigger.midY)
+            let away = CGPoint(x: point.x, y: peek.geometry.panel.minY - 30)
             let time = ProcessInfo.processInfo.systemUptime
+            poll(mouse: away, time: time, pointerDown: false)
             poll(mouse: point, time: time, pointerDown: false)
             poll(mouse: point, time: time + 0.3, pointerDown: false)
         }

@@ -5,11 +5,10 @@ struct Snapshot: Decodable, Sendable {
     let schema: Int
     let snapshotAt: Double
     let instances: [InstanceRecord]
-    let tasks: [TaskRecord]
     let liveAttempts: [LiveAttempt]?
 
     enum CodingKeys: String, CodingKey {
-        case schema, instances, tasks
+        case schema, instances
         case snapshotAt = "snapshot_at"
         case liveAttempts = "live_attempts"
     }
@@ -230,25 +229,6 @@ struct QuotaWindow: Decodable, Identifiable, Sendable {
     }
 }
 
-struct TaskRecord: Decodable, Identifiable, Sendable {
-    let id: String
-    let kind: String?
-    let state: String
-    let activity: String?
-    let instance: String?
-    let target: String?
-    let allowed: [String]
-    let blockedBy: String?
-    let waitUntil: Double?
-
-    enum CodingKeys: String, CodingKey {
-        case id, kind, state, activity, instance, target, allowed
-        case blockedBy = "blocked_by"
-        case waitUntil = "wait_until"
-    }
-
-}
-
 struct DeletionPreview: Decodable, Sendable {
     let instance: String
     let attempts: [String]
@@ -352,7 +332,6 @@ final class Dashboard: ObservableObject {
     }
 
     var instances: [InstanceRecord] { snapshot?.instances ?? [] }
-    var tasks: [TaskRecord] { snapshot?.tasks ?? [] }
     var selected: InstanceRecord? { instances.first { $0.id == selection } }
     private var lastKnownAttempts: [LiveAttempt] {
         LiveAttempt.normalized(snapshot?.liveAttempts ?? [])
@@ -378,7 +357,6 @@ final class Dashboard: ObservableObject {
         return result
     }
 
-    var queueCount: Int { tasks.filter { ["queued", "waiting_quota"].contains($0.state) }.count }
     var signedInCount: Int { instances.filter { $0.login == "signed_in" }.count }
 
     func choose(_ instance: String?) {

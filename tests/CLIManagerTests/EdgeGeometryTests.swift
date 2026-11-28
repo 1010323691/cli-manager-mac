@@ -3,6 +3,13 @@ import XCTest
 @testable import CLIManager
 
 final class EdgeGeometryTests: XCTestCase {
+    func testPanelReservesExactlyTwoRows() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let geometry = EdgeGeometry(screen: screen, visible: screen.inset(by: CGRect.Inset(top: 24)), safeTop: 0)
+        XCTAssertEqual(EdgeGeometry.activityHeight, 70)
+        XCTAssertEqual(geometry.panel.height, 129)
+    }
+
     func testExternalDisplayUsesItsOwnCoordinateSpace() {
         let screen = CGRect(x: -1920, y: 500, width: 1920, height: 1040)
         let geometry = EdgeGeometry(screen: screen, visible: screen.inset(by: CGRect.Inset(top: 24)), safeTop: 0)
