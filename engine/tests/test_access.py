@@ -48,6 +48,13 @@ class PolicyTest(unittest.TestCase):
         (self.work / "run.sh").write_text("node tool.mjs > out.log 2>&1\n")
         (self.work / "node_modules/.bin").mkdir(parents=True)
         (self.work / "node_modules/.bin/vitest").write_text("")
+        # Code that reads a property named like a key file is not a credential path.
+        (self.work / "keys.sh").write_text("node -e 'const e = rows.find(r => r.id); console.log(e.key, cert.pem)'\n")
+        self.assertIsNone(self.review("sh keys.sh"))
+        (self.work / "leak.sh").write_text("cat ./certs/server.key\n")
+        self.assertIn("凭据", self.review("sh leak.sh") or "")
+        (self.work / "leak2.sh").write_text("cp ~/.ssh/config x\n")
+        self.assertIn("凭据", self.review("sh leak2.sh") or "")
         for command in ("node tool.mjs --port 5173", "/bin/zsh -lc 'sh run.sh'", "npx vitest run",
                         "node tool.mjs --query 'q=low&dpr=1' > out.json",
                         "'/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' --headless=new"):
