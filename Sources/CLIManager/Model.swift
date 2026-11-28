@@ -81,6 +81,20 @@ struct ProbeDiagnostic: Decodable, Sendable {
     }
 }
 
+extension InstanceRecord {
+    /// Whether the instance's bound account should be queried for quota.
+    ///
+    /// A bound instance whose login reads "unknown" without a failed probe has no usable cached
+    /// status: it was never probed, or the status was written by another engine version. Only a
+    /// query can settle it, so it counts; otherwise it would stay "登录未知" until refreshed by hand.
+    var hasQuotaAccount: Bool {
+        guard quotaGroup != nil else { return false }
+        if login == "signed_in" { return true }
+        if probeFailed { return lastConfirmedAuth?.login == "signed_in" }
+        return login == "unknown"
+    }
+}
+
 struct InstanceRecord: Decodable, Identifiable, Sendable {
     let id: String
     let guardToken: String
@@ -299,7 +313,7 @@ final class Dashboard: ObservableObject {
     private var quotaTriggers = QuotaLifecycle()
     private var startupQuotaGroups: Set<String>?
     private var quotaInFlight: Set<String> = []
-    private var autoQuotaTask: Task<Void, Never>?
+    private var autoQuotaTasks: [String: Task<Void, Never>] = [:]
     private var resetRetries: [String: QuotaResetRetries] = [:]
     @Published private var probeFailures: [String: ProbeFailure] = [:]
 
@@ -488,10 +502,7 @@ final class Dashboard: ObservableObject {
         return outcome
     }
 
-    private func hasQuotaAccount(_ instance: InstanceRecord) -> Bool {
-        instance.quotaGroup != nil &&
-            (instance.login == "signed_in" || (instance.probeFailed && instance.lastConfirmedAuth?.login == "signed_in"))
-    }
+    private func hasQuotaAccount(_ instance: InstanceRecord) -> Bool { instance.hasQuotaAccount }
 
     private func observeQuotaTriggers(_ records: [InstanceRecord]) {
         let accounts = Set(records.filter(hasQuotaAccount).compactMap(\.quotaGroup))
@@ -517,8 +528,24 @@ final class Dashboard: ObservableObject {
         }
     }
 
+    /// Accounts are independent at the provider and each query locks only its own instance, so
+    /// automatic queries run side by side: one per account, a few accounts at a time.
+    static let automaticQuotaConcurrency = 4
+
+    /// Accounts to start querying now: candidates in priority order, one instance per account,
+    /// skipping accounts already being queried, up to the free slots.
+    static func automaticQuotaBatch(_ candidates: [(instance: String, group: String)], busy: Set<String>,
+                                    limit: Int = automaticQuotaConcurrency) -> [String] {
+        var seen = busy
+        var chosen: [String] = []
+        for candidate in candidates where chosen.count < max(0, limit - busy.count) {
+            if seen.insert(candidate.group).inserted { chosen.append(candidate.instance) }
+        }
+        return chosen
+    }
+
     func scheduleAutomaticQuotas() {
-        guard snapshotError == nil, autoQuotaTask == nil else { return }
+        guard snapshotError == nil else { return }
         let now = Date.now.timeIntervalSince1970
         let eligible = instances.filter(quotaEligible).sorted { lhs, rhs in
             if lhs.probeFailed != rhs.probeFailed { return !lhs.probeFailed }
@@ -529,25 +556,31 @@ final class Dashboard: ObservableObject {
             let retries = resetRetries[group] ?? QuotaResetRetries()
             return instance.quota.resetEvents?.contains { retries.allows($0, now: now) } == true
         }
-        let target = eligible.first { quotaTriggers.pending[$0.guardToken] != nil }
-            ?? eligible.first { $0.quotaGroup.map { startupQuotaGroups?.contains($0) == true } == true }
-            ?? eligible.first(where: isDue)
-        guard let target, let group = target.quotaGroup else { return }
-        let event = quotaTriggers.pending[target.guardToken]
-        let resets = (target.quota.resetEvents ?? []).filter { $0.resetsAt <= now }
-        autoQuotaTask = Task { [weak self] in
-            guard let self else { return }
-            let result = await queryQuota(target, announce: false)
-            autoQuotaTask = nil
-            // If the binding changed or a concurrent operation acquired the
-            // profile, let the next snapshot choose a fresh candidate.
-            guard result != .skipped else { return }
-            startupQuotaGroups?.remove(group)
-            if let event { quotaTriggers.complete(target.guardToken, through: event) }
-            if !resets.isEmpty {
-                resetRetries[group, default: QuotaResetRetries()].record(resets, now: Date.now.timeIntervalSince1970)
+        // A finished call first, then accounts not yet read since launch, then due resets.
+        let ordered = eligible.filter { quotaTriggers.pending[$0.guardToken] != nil }
+            + eligible.filter { $0.quotaGroup.map { startupQuotaGroups?.contains($0) == true } == true }
+            + eligible.filter(isDue)
+        let chosen = Self.automaticQuotaBatch(ordered.compactMap { instance in
+            instance.quotaGroup.map { (instance.id, $0) }
+        }, busy: Set(autoQuotaTasks.keys))
+        for id in chosen {
+            guard let target = eligible.first(where: { $0.id == id }), let group = target.quotaGroup else { continue }
+            let event = quotaTriggers.pending[target.guardToken]
+            let resets = (target.quota.resetEvents ?? []).filter { $0.resetsAt <= now }
+            autoQuotaTasks[group] = Task { [weak self] in
+                guard let self else { return }
+                let result = await queryQuota(target, announce: false)
+                autoQuotaTasks[group] = nil
+                // If the binding changed or a concurrent operation acquired the
+                // profile, let the next snapshot choose a fresh candidate.
+                guard result != .skipped else { return }
+                startupQuotaGroups?.remove(group)
+                if let event { quotaTriggers.complete(target.guardToken, through: event) }
+                if !resets.isEmpty {
+                    resetRetries[group, default: QuotaResetRetries()].record(resets, now: Date.now.timeIntervalSince1970)
+                }
+                if !Task.isCancelled { scheduleAutomaticQuotas() }
             }
-            if !Task.isCancelled { scheduleAutomaticQuotas() }
         }
     }
 
