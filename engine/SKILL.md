@@ -12,6 +12,6 @@ description: 管理独立登录的 Claude Code 和 Codex CLI 实例。用户要�
 ## 主流程
 
 1. 用 Python 3.11+ 调用本 Skill 的 `scripts/delegate.py`。先确认 [实例和登录状态](references/instances.md)，按用户授权限定任务可用的实例。
-2. 主会话写简报，列清目标、范围、验证要求和依赖。用 `task submit` 入队，后台启动 `queue work`，通过 `task watch` 和 `task decide` 处理进度及待批请求。Codex 任务默认运行在开放档：可联网、可生图，工作树里带有项目中被忽略的内容，可读本机技能与工具环境，越出沙箱的命令作为待批请求交主会话逐条审批。只有提交时写明 `--access sandbox` 才使用封闭沙箱。凭据路径在任何档位都拒绝，推送、发布和删除工作树外文件必须逐条审批。参数、档位和额度判断见 [任务与调度](references/scheduling.md)。
+2. 主会话写简报，列清目标、范围、验证要求和依赖。用 `task submit` 入队，后台启动 `queue work`，通过 `task watch` 和 `task decide` 处理进度及待批请求。Codex 任务默认运行在智能档：可联网、可生图，工作树里带有项目中被忽略的内容，可读本机技能与工具环境，越出沙箱的例行请求（在任务目录内起本机服务、无头浏览器等）由控制器自动放行并记录，其余作为待批请求交主会话逐条审批，要全部过目时用 `--access open`。只有提交时写明 `--access sandbox` 才使用封闭沙箱。凭据路径在任何档位都拒绝，推送、发布和删除工作树外文件必须逐条审批。参数、档位和额度判断见 [任务与调度](references/scheduling.md)。
 3. 任务中断时，按任务状态和用户授权决定等待、原会话续跑、重试或交接。由主会话整理交接简报。见 [续跑与交接](references/handoff.md)。
 4. 主会话读取报告和实际补丁，审核结果后按依赖顺序预览并应用。生图按同一队列跟踪，审核后导出。见 [审核与应用](references/review-and-apply.md) 和 [生图](references/images.md)。

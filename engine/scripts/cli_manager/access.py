@@ -9,9 +9,9 @@ from pathlib import Path
 
 from .store import DelegateError
 
-TIERS = ("open", "sandbox", "full")
+TIERS = ("smart", "open", "sandbox", "full")
 NETWORKS = ("on", "loopback", "off")
-DEFAULT = {"access": "open", "network": "on", "allow_domains": [], "read_dirs": [], "write_dirs": [],
+DEFAULT = {"access": "smart", "network": "on", "allow_domains": [], "read_dirs": [], "write_dirs": [],
            "image": True}
 # Tasks recorded before capabilities existed keep the closed profile they were submitted with.
 LEGACY = {"access": "sandbox", "network": "off", "allow_domains": [], "read_dirs": [], "write_dirs": [],
@@ -179,7 +179,7 @@ def of(task):
 
 
 def is_open(capabilities):
-    return capabilities.get("access") in ("open", "full")
+    return capabilities.get("access") in ("smart", "open", "full")
 
 
 def tool_roots():
@@ -361,6 +361,108 @@ def classify_command(command, cwd, *, secrets, writable, env_home=None):
             if path is None or not inside(path, writable):
                 return "irreversible", paths
     return None, paths
+
+
+# `smart` settles routine out-of-sandbox requests itself and sends the rest to the planning session.
+# Commands that change the machine, reach other hosts or hand control to another program are never routine.
+SMART_REVIEW = re.compile(
+    r"(?:^|[\s;&|(`'\"/])(?:sudo|doas|su|osascript|launchctl|defaults|networksetup|systemsetup|scutil|spctl|csrutil|"
+    r"tccutil|pmset|crontab|at|chflags|chown|chgrp|xattr|kill|pkill|killall|open|ssh|scp|sftp|rsync|curl|wget|nc|"
+    r"ncat|telnet|ftp|brew|port|pipx|eval|source)(?=$|[\s;&|)'\"])|"
+    r"(?:npm|pnpm|yarn|bun)\s+(?:[^;&|]*\s)?(?:-g|--global)\b|(?:pip|pip3|uv\s+pip)\s+install\b|"
+    # Installing packages pulls and runs third-party code.
+    r"(?:npm|pnpm|yarn|bun)\s+(?:[^;&|]*\s)?(?:install|i|add|ci|update|upgrade|dlx|create)\b|"
+    r"(?:cargo|gem|go)\s+install\b|(?:bunx|uvx|pipx)\b|"
+    r"git\s+config\s+(?:[^;&|]*\s)?--(?:global|system)\b|chmod\s+(?:[^;&|]*\s)?-R\b|"
+    r"(?:>|>>)\s*(?:/|~)|\$\(|`", re.I)
+SMART_SCRIPT_REVIEW = re.compile(
+    r"\b(?:sudo|osascript|launchctl|networksetup|crontab|killall|pkill)\b|child_process[^\n]*\b(?:exec|execSync)\s*\(|"
+    r"\bos\.system\s*\(|\bsubprocess\.[a-z_]+\([^\n]*shell\s*=\s*True|\beval\s*\(|"
+    r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*\s+(?:/|~|\$HOME)", re.I)
+URL = re.compile(r"\b(?:https?|wss?|ftp)://([^/\s'\"`:)\]]+|\[[^\]]+\])", re.I)
+LOOPBACK = {"localhost", "127.0.0.1", "[::1]", "::1", "0.0.0.0"}
+SCRIPT_RUNNERS = {"sh", "bash", "zsh", "dash", "node", "bun", "deno", "python", "python3", "ruby", "perl", "tsx",
+                  "vite-node", "npx", "uv"}
+SCRIPT_LIMIT = 256 * 1024
+
+
+def loopback(target):
+    host = re.sub(r"^[a-z][a-z0-9+.-]*://", "", str(target or ""), flags=re.I).split("/")[0]
+    host = host if host.startswith("[") else host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    return host.lower() in LOOPBACK or host.lower().endswith(".localhost")
+
+
+def script_review(text, *, secrets):
+    """Why a script the worker wants to run outside the sandbox needs a person to read it, or None."""
+    if SMART_SCRIPT_REVIEW.search(text) or IRREVERSIBLE.search(text) or SECRET_COMMANDS.search(text):
+        return "脚本含改动系统、不可逆或凭据相关的操作"
+    for host in URL.findall(text):
+        if not loopback(host):
+            return f"脚本访问本机之外的地址：{host}"
+    for name in re.findall(r"[\w.~/-]+", text):
+        part = Path(name).name
+        if part.casefold() in SECRET_NAMES or SECRET_GLOBS.match(part):
+            return f"脚本提到凭据路径：{part}"
+    return None
+
+
+def smart_review(kind, display, floor, *, secrets, own, readable):
+    """Reason the planning session must decide this request, or None when `smart` may accept it.
+
+    Accepted without asking: a command (or file change) with no floor, no extra permission grant and no
+    host beyond loopback, whose every named path lies in the task's own directories (`own`) or the
+    read-only tool locations (`readable`), and whose scripts, when it runs any, were read and are routine.
+    """
+    if floor:
+        return "触及安全底线"
+    if kind == "permissions":
+        return "申请额外权限"
+    if display.get("additional_permissions"):
+        return "命令附带额外权限"
+    if any(not loopback(target) for target in display.get("network") or []):
+        return "访问本机之外的网络"
+    if kind == "file_change":
+        outside = [path for path in display.get("paths") or [] if not inside(path, own)]
+        return f"修改任务目录之外的文件：{outside[0]}" if outside else None
+    command = display.get("command") or ""
+    if SMART_REVIEW.search(command):
+        return "命令改动系统、访问其他主机或把控制交给其他程序"
+    for host in URL.findall(command):
+        if not loopback(host):
+            return f"命令访问本机之外的地址：{host}"
+    for path in display.get("paths") or []:
+        if not inside(path, own) and not inside(path, readable):
+            return f"命令涉及任务目录之外的路径：{path}"
+    cwd = display.get("cwd")
+    if cwd and not inside(cwd, own):
+        return "命令不在任务目录内执行"
+    for tokens in segments(command):
+        if Path(tokens[0]).name == "npx":
+            # `npx <tool>` downloads the package when the project does not have it.
+            tool = next((token for token in tokens[1:] if not token.startswith("-")), None)
+            folder = Path(os.path.realpath(cwd or "/"))
+            installed = tool and any((parent / "node_modules" / ".bin" / tool).exists()
+                                     for parent in (folder, *folder.parents) if inside(parent, own))
+            if not installed:
+                return f"npx 会下载并运行项目里没有的包：{tool or '?'}"
+        if Path(tokens[0]).name not in SCRIPT_RUNNERS:
+            continue
+        for token in tokens[1:]:
+            path = expand(token, cwd, str(home()))
+            if path is None or not path.is_file() or path.suffix in (".json", ".md", ".txt", ".log"):
+                continue
+            if not inside(path, own):
+                continue   # a tool on a read-only root; named paths outside both sets were refused above
+            try:
+                if path.stat().st_size > SCRIPT_LIMIT:
+                    return f"脚本过大，未能读完：{path.name}"
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return f"脚本读不到：{path.name}"
+            reason = script_review(text, secrets=secrets)
+            if reason:
+                return f"{path.name}：{reason}"
+    return None
 
 
 def classify_changes(changes, *, secrets, writable):
