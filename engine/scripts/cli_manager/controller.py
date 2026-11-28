@@ -17,7 +17,7 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
-from . import backend, workspace
+from . import access, backend, workspace
 from .store import DelegateError, digest, identifier, identity, lock, write, write_json
 
 ACTIVE = {"starting", "running", "stopping"}
@@ -258,8 +258,29 @@ def record_submission(store, name, spec, baseline, allowed, images, *, batch=Non
     if batch:
         task["batch"] = batch
     store.put("tasks", task)
-    store.event(name, "submitted", allowed=allowed, dependencies=task["dependencies"])
+    store.event(name, "submitted", allowed=allowed, dependencies=task["dependencies"],
+                capabilities=access.summary(access.of(task)))
     return task
+
+
+def resolve_capabilities(store, spec, allowed, *, interactive=None):
+    """Effective capability tier for a submission, checked against the instances it may run on."""
+    requested = spec.pop("capabilities", None)
+    capabilities = access.normalize(store, requested, kind=spec["kind"], interactive=interactive)
+    providers = {name: store.get("instances", name) for name in {*allowed, *spec["handoff_targets"]}}
+    codex = [row for row in providers.values() if row["provider"] == "codex"]
+    explicit = [key for key in capabilities.get("explicit", []) if key != "access" or capabilities["access"] != "sandbox"]
+    if not codex and explicit and capabilities["access"] != "sandbox":
+        raise DelegateError("开放档能力（" + "、".join(explicit) + "）只适用于 Codex 实例；"
+                            "Claude 实例使用封闭沙箱，请去掉这些选项或改派 Codex")
+    needs = backend.required_capabilities(capabilities)
+    for row in codex:
+        reported = (row.get("status") or {}).get("capabilities")
+        missing = sorted(set(needs) & set((reported or {}).get("missing", [])))
+        if missing:
+            raise DelegateError(f"实例 {row['id']} 的 Codex 不支持所需能力：{'、'.join(missing)}；"
+                                "请升级 CLI、改用其他实例或显式选择受支持的档位，不会自动降级为封闭沙箱")
+    return capabilities
 
 
 def image_baseline():
@@ -282,6 +303,8 @@ def submit(store, spec, prompt, references):
         if store.get("tasks", name, required=False) or os.path.lexists(directory):
             raise DelegateError("任务 ID 或目录已存在")
         allowed = submission_routes(store, spec, selected, provider)
+        # Before any transaction: `full` waits for a person at the terminal.
+        spec["capabilities"] = resolve_capabilities(store, spec, allowed)
         if spec["kind"] != "image":
             if project is None or not project.is_dir():
                 raise DelegateError("代码任务需要有效的 --project")
@@ -317,8 +340,12 @@ def submit_batch(store, spec, prompts, references):
     with tempfile.TemporaryDirectory(dir=store.root) as temporary, ExitStack() as locks:
         staging = Path(temporary)
         images = stage_references(references, staging / "_references")
-        manifest = digest({"members": list(members.items()), "spec": spec, "instances": selected,
-                           "backend": provider, "references": images})
+        # A batch submitted before capability tiers existed stays idempotent when resubmitted as is.
+        requested = spec.get("capabilities") or {}
+        plain = not any(value not in (None, [], False) for value in requested.values())
+        manifest = digest({"members": list(members.items()),
+                           "spec": {key: value for key, value in spec.items() if key != "capabilities"} if plain else spec,
+                           "instances": selected, "backend": provider, "references": images})
         marker = ".batch-submission.json"
         metadata = {}
         for name, (source, prompt) in members.items():
@@ -344,6 +371,7 @@ def submit_batch(store, spec, prompts, references):
                 if collision:
                     raise DelegateError(f"批次成员的任务 ID 已存在：{collision}")
                 allowed = submission_routes(store, spec, selected, provider)
+                spec["capabilities"] = resolve_capabilities(store, spec, allowed)
                 destinations = {name: store.task_dir(name) for name in members}
                 for name, directory in destinations.items():
                     if os.path.lexists(directory):
@@ -470,6 +498,9 @@ def choose(store, task, instances, active, now):
             continue
         if task["kind"] == "image" and not (instance["provider"] == "codex" and info.get("image")):
             continue
+        if instance["provider"] == "codex" and set(backend.required_capabilities(access.of(task))) & set(
+                (info.get("capabilities") or {}).get("missing", [])):
+            continue  # never run a task below the tier it was submitted with
         prior = store.get("attempts", task["attempt"]) if task.get("native_resume") else None
         if prior and (prior["generation"] != instance["generation"] or prior["account"] != account):
             continue
@@ -805,10 +836,19 @@ def run_native(store, instance, task, attempt, directory, cancel):
         data.update(workspace.setup(directory, store.task_dir(task["id"]) / "baseline.git",
                                     task, attempt, patches, checkpoint))
     elif attempt.get("checkpoint_tree"):
-        repo, work = Path(attempt["repo"]), Path(attempt["work"])
-        tree = workspace.snapshot(repo, work, attempt["base"], force_all=not task["baseline"]["git"])
-        if workspace.text(repo, "rev-parse", tree + "^{tree}") != attempt["checkpoint_tree"]:
-            raise DelegateError("原生续跑的工作目录已偏离检查点")
+        # Only controlled files count: links to the original project's ignored content and
+        # ignored artefacts left in the workspace (screenshots, logs) are not a deviation.
+        changed = workspace.drift(Path(attempt["repo"]), Path(attempt["work"]), attempt,
+                                  force_all=not task["baseline"]["git"])
+        if changed:
+            listed = "、".join(changed[:8]) + ("…" if len(changed) > 8 else "")
+            raise DelegateError(f"原生续跑的工作目录已偏离检查点（受控文件：{listed}）")
+    if (task["kind"] != "image" and instance["provider"] == "codex" and access.is_open(access.of(task))
+            and (data.get("work") or attempt.get("work"))):
+        data["mounts"] = workspace.mount_ignored(task, Path(data.get("work") or attempt["work"]),
+                                                 attempt.get("mounts") or ())
+        if task["baseline"]["git"]:
+            workspace.register_mounts(Path(data.get("repo") or attempt["repo"]), data["mounts"])
     attempt.update(data)
     with store.transaction():
         row = store.get("attempts", attempt["id"])
@@ -816,7 +856,7 @@ def run_native(store, instance, task, attempt, directory, cancel):
         store.put("attempts", row)
     if cancel.is_set():
         return data, {"outcome": "cancelled"}
-    env = backend.environment(store, instance, attempt)
+    env = backend.worker_environment(store, instance, task, attempt)
     action = (backend.collect_image if task["kind"] == "image" else
               backend.collect_codex if instance["provider"] == "codex" else backend.collect_claude)
     configured_task = {**task, **(attempt.get("model_selection") or {})}
@@ -876,7 +916,8 @@ def capture_result(store, task, attempt, result):
     if attempt.get("repo"):
         repo, work = Path(attempt["repo"]), Path(attempt["work"])
         try:
-            commit = workspace.snapshot(repo, work, attempt["base"], force_all=not task["baseline"]["git"])
+            commit = workspace.snapshot(repo, work, attempt["base"], force_all=not task["baseline"]["git"],
+                                        exclude=attempt.get("mounts") or ())
             workspace.git(repo, "update-ref", "refs/heads/checkpoint", commit)
             attempt.update(checkpoint=commit, checkpoint_tree=workspace.text(repo, "rev-parse", commit + "^{tree}"))
             paths = workspace.changes(attempt, commit)
@@ -894,7 +935,35 @@ def capture_result(store, task, attempt, result):
         exported = store.task_dir(task["id"]) / "reports" / (attempt["id"] + source.suffix)
         write(exported, source.read_bytes())
         artifacts.append(artifact(exported))
+    for index, generated in enumerate(result.get("generated") or [], 1):
+        # Built-in image generation inside a code task: keep a controller-owned copy for review
+        # and note where the worker placed the image.
+        source = Path(generated)
+        exported = store.task_dir(task["id"]) / "reports" / f"{attempt['id']}-image{index}{source.suffix.lower()}"
+        write(exported, source.read_bytes())
+        record = artifact(exported)
+        record.update(kind="generated_image", copies=image_copies(task, attempt, paths, record))
+        artifacts.append(record)
     return paths, patch, artifacts, validation_issue
+
+
+def image_copies(task, attempt, paths, record):
+    """Where the worker put a generated image: changed workspace paths and granted write directories."""
+    candidates = [Path(attempt["work"]) / path for path in paths] if attempt.get("work") else []
+    for directory in access.of(task).get("write_dirs") or []:
+        for index, path in enumerate(Path(directory).rglob("*")):
+            if index >= 5000:
+                break
+            candidates.append(path)
+    copies = []
+    for path in candidates:
+        try:
+            if (path.suffix.lower() in backend.IMAGE_FORMATS and path.is_file() and not path.is_symlink()
+                    and path.stat().st_size == record["bytes"] and artifact(path)["sha256"] == record["sha256"]):
+                copies.append(str(path))
+        except OSError:
+            continue
+    return copies
 
 
 def finish(store, task, attempt, result, prepared=None):
@@ -946,6 +1015,10 @@ def finish(store, task, attempt, result, prepared=None):
               "work": attempt.get("work"), "commit": attempt.get("checkpoint"),
               "dependencies": attempt["revisions"], "artifacts": artifacts,
               "patch_sha256": hashlib.sha256(patch).hexdigest()}
+    if attempt.get("capabilities"):
+        # Tasks from before capability tiers keep their original report shape.
+        report["capabilities"] = attempt["capabilities"]
+        report["approvals"] = approval_summary(attempt)
     reports = store.task_dir(task["id"])
     revision = digest(report)
     report.update(revision=revision)
@@ -959,6 +1032,7 @@ def finish(store, task, attempt, result, prepared=None):
         summary += ["", str(report["diagnostic"])]
     write(report_path, ("\n".join(summary) + "\n").encode())
     attempt["report"] = revision
+    attempt["artifacts"] = artifacts
     store.put("attempts", attempt)
     if task["state"] != "stale":
         task.update(state=state, report=revision, review_candidate=None,
@@ -966,6 +1040,27 @@ def finish(store, task, attempt, result, prepared=None):
                     target=task.get("target") if code == "quota" else None)
     store.put("tasks", task)
     store.event(task["id"], "attempt_finished", attempt=attempt["id"], outcome=code, report=revision)
+
+
+def approval_summary(attempt):
+    """Requests of the attempt's current run and how each was settled."""
+    rows = []
+    if not attempt.get("logs"):
+        return rows
+    folder = Path(attempt["logs"]) / "approvals"
+    for request_file in sorted(folder.glob("*.request.json")):
+        key = request_file.name.replace(".request.json", "")
+        try:
+            request = read(request_file)
+            decision = read(folder / f"{key}.decision.json") if (folder / f"{key}.decision.json").is_file() else {}
+        except (OSError, ValueError):
+            continue
+        inputs = request.get("input") or {}
+        rows.append({"request": key, "kind": request.get("kind"), "floor": request.get("floor"),
+                     "command": inputs.get("command"), "cwd": inputs.get("cwd"), "paths": inputs.get("paths"),
+                     "network": inputs.get("network"), "behavior": decision.get("behavior") or "unanswered",
+                     "always": bool(decision.get("always")), "by": decision.get("by")})
+    return rows
 
 
 def stop_task(store, name):
@@ -1022,7 +1117,7 @@ def get_pending(store, task):
     return pending_requests(folder), folder
 
 
-def decide(store, name, request_id, action, answers, message):
+def decide(store, name, request_id, action, answers, message, always=False):
     identifier(request_id)
     with store.transaction():
         task = store.get("tasks", name)
@@ -1034,6 +1129,9 @@ def decide(store, name, request_id, action, answers, message):
         question = request.get("kind") == "question"
         if action != "deny" and question != (action == "answer"):
             raise DelegateError("提问使用 answer，工具审批使用 allow")
+        native = request.get("provider") == "codex" and not question
+        if always and (action != "allow" or not native):
+            raise DelegateError("--always 只用于批准 Codex 的越界请求")
         if action == "answer":
             provided = {}
             for item in inputs.get("questions") or []:
@@ -1049,6 +1147,12 @@ def decide(store, name, request_id, action, answers, message):
                 decision = {"behavior": "allow", "updatedInput": {**inputs, "answers": answer}}
             else:
                 decision = {"behavior": "answer", "answers": provided}
+        elif action == "allow" and native:
+            # The request came from an open-tier Codex worker; the floor was applied before it was
+            # shown. An irreversible action is approved one request at a time, never for the session.
+            if always and not request.get("session_allow"):
+                raise DelegateError("不可逆操作（推送、发布、删除工作树外文件等）必须逐条审批，不能本会话放行")
+            decision = {"behavior": "allow", "always": bool(always), "by": "planner"}
         elif action == "allow":
             if tool not in {"Bash", "Read", "Edit", "Write", "MultiEdit", "Glob", "Grep"}:
                 raise DelegateError("这类权限请求不能扩大任务沙箱")
@@ -1066,8 +1170,14 @@ def decide(store, name, request_id, action, answers, message):
         else:
             decision = {"behavior": "deny", "message": message or "主会话拒绝此请求"}
         write_json(folder / f"{request_id}.decision.json", decision)
-        store.event(name, "approval_decided", attempt=task["attempt"], request=request_id, action=action)
-    return {"id": request_id, "action": action}
+        detail = {"always": True} if always else {}
+        if native:
+            inputs_view = request.get("input") or {}
+            detail.update(request_kind=request.get("kind"), floor=request.get("floor"),
+                          command=inputs_view.get("command"), cwd=inputs_view.get("cwd"),
+                          paths=inputs_view.get("paths"), network=inputs_view.get("network"))
+        store.event(name, "approval_decided", attempt=task["attempt"], request=request_id, action=action, **detail)
+    return {"id": request_id, "action": action, **({"always": True} if always else {})}
 
 
 def prepare_handoff(store, name):
@@ -1099,9 +1209,18 @@ def prepare_handoff(store, name):
     return {"material": str(path), "source": attempt["id"], "preauthorized": task["handoff_targets"]}
 
 
-def start_handoff(store, name, target, brief, authorized, source_id, model=None, effort=None):
+def start_handoff(store, name, target, brief, authorized, source_id, model=None, effort=None, *,
+                  authorize_access=False, confirm_full=False, interactive=None):
     if not brief.strip():
         raise DelegateError("交接要求主会话撰写简报")
+    preview, destination = store.get("tasks", name), store.get("instances", target)
+    if (access.of(preview)["access"] == "full" and destination["provider"] == "codex"
+            and not (target in preview["handoff_targets"]
+                     and preview.get("bindings", {}).get(target) == destination["generation"])):
+        # `full` is granted by a person for named accounts; another account needs the same confirmation.
+        if not confirm_full:
+            raise DelegateError("full 档交接到另一个账户需要 --confirm-full，并由用户在交互式终端确认")
+        access.confirm_full(interactive)
     with store.transaction():
         task = store.get("tasks", name)
         if task["state"] in ACTIVE | FINISHED | {"approved", "applying", "queued"}:
@@ -1127,6 +1246,19 @@ def start_handoff(store, name, target, brief, authorized, source_id, model=None,
             raise DelegateError("目标实例尚未完成账户绑定")
         if task["kind"] != "image" and not source.get("checkpoint"):
             raise DelegateError("源尝试没有安全检查点")
+        capabilities = access.of(task)
+        # The tier travels with the task. A target named at submission was granted it together with
+        # the task, for the account it was logged in to then; any other account is granted it again.
+        changed_account = not (target in task["handoff_targets"] and generation == other["generation"])
+        if other["provider"] == "codex" and access.is_open(capabilities):
+            if changed_account and not authorize_access:
+                raise DelegateError(
+                    f"目标实例的账户未随任务授权或已切换：交接会把 {capabilities['access']} 档"
+                    f"（网络 {capabilities['network']}、授权目录、生图）一并带过去，请在获得授权后加 --authorize-access")
+            missing = sorted(set(backend.required_capabilities(capabilities))
+                             & set(((other.get("status") or {}).get("capabilities") or {}).get("missing", [])))
+            if missing:
+                raise DelegateError(f"目标实例的 Codex 不支持所需能力：{'、'.join(missing)}")
         path = store.task_dir(name) / "handoffs" / (new_id(source_id) + ".brief.md")
         write(path, brief.encode())
         task.setdefault("bindings", {})[target] = other["generation"]
@@ -1136,7 +1268,9 @@ def start_handoff(store, name, target, brief, authorized, source_id, model=None,
                     effort=effort or (task.get("effort") if other["provider"] == original["provider"] else None),
                     handoff={"source": source_id, "brief": str(path), "target": target})
         store.put("tasks", task)
-        store.event(name, "handoff_queued", source=source_id, target=target)
+        store.event(name, "handoff_queued", source=source_id, target=target,
+                    capabilities=access.summary(capabilities), account_changed=changed_account,
+                    access_reauthorized=bool(changed_account and authorize_access))
     return task
 
 

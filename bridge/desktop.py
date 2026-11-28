@@ -23,7 +23,7 @@ HERE = Path(__file__).resolve().parent
 LEGACY = HERE / "Legacy"
 if not LEGACY.is_dir() and (HERE.parent / "Package.swift").is_file():
     source = os.environ.get("CLI_MANAGER_LEGACY_SOURCE")
-    LEGACY = Path(source).expanduser().resolve() if source else HERE.parent.parent / "cli-manager"
+    LEGACY = Path(source).expanduser().resolve() if source else HERE.parent / "engine"
 sys.path[:0] = [str(LEGACY / "scripts"), str(HERE)]
 
 import activity_output

@@ -47,6 +47,58 @@ def edit(prompt):
             Path(path).rename(".rename-fixture").rename(target)
 
 
+def ask(method, params):
+    """Send a server request and return the client's result, answering steers that arrive first."""
+    ask.count = getattr(ask, "count", 0) + 1
+    key = f"approval-{ask.count}"
+    emit({"id": key, "method": method, "params": params})
+    while True:
+        response = json.loads(sys.stdin.readline())
+        if response.get("id") == key and "method" not in response:
+            with (directory / "fixture-approvals").open("a") as log:
+                print(json.dumps({"method": method, "params": params, "result": response.get("result")}), file=log)
+            return response.get("result")
+        if "method" in response and "id" in response:
+            with (directory / "fixture-steers").open("a") as log:
+                print(json.dumps(response["params"]), file=log)
+            emit({"id": response["id"], "result": {}})
+
+
+def escalations(prompt, thread):
+    """`approve-command <cmd>`, `approve-delete <path>`, `approve-permission <path>`, `generate-image <dest>`."""
+    for line in prompt.splitlines():
+        verb, _, value = line.partition(" ")
+        base = {"threadId": thread, "turnId": "turn", "startedAtMs": 1}
+        if verb == "approve-command":
+            result = ask("item/commandExecution/requestApproval",
+                         {**base, "itemId": "cmd", "command": value, "cwd": str(Path.cwd()), "reason": "fixture"})
+            if result["decision"] in ("accept", "acceptForSession"):
+                marker = Path.cwd() / "approved.log"
+                marker.write_text((marker.read_text() if marker.exists() else "") + value + "\n")
+        elif verb == "approve-network":
+            ask("item/commandExecution/requestApproval",
+                {**base, "itemId": "net", "command": "curl " + value, "cwd": str(Path.cwd()),
+                 "networkApprovalContext": {"host": value, "protocol": "https"}})
+        elif verb == "approve-delete":
+            emit({"method": "item/started", "params": {"item": {"type": "fileChange", "id": "change", "changes": [
+                {"path": value, "kind": {"type": "delete"}, "diff": ""}]}}})
+            ask("item/fileChange/requestApproval", {**base, "itemId": "change", "reason": "fixture"})
+        elif verb == "approve-permission":
+            ask("item/permissions/requestApproval",
+                {**base, "cwd": str(Path.cwd()), "reason": "fixture",
+                 "permissions": {"fileSystem": {"read": [value]}}})
+        elif verb == "generate-image":
+            folder = directory / "generated_images" / thread
+            folder.mkdir(parents=True, exist_ok=True)
+            image = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aR3cAAAAASUVORK5CYII=")
+            (folder / "code.png").write_bytes(image)
+            if value:
+                Path(value).parent.mkdir(parents=True, exist_ok=True)
+                Path(value).write_bytes(image)
+            emit({"method": "item/completed", "params": {"item": {"type": "imageGeneration", "id": "image",
+                  "status": "completed", "failure": None, "savedPath": str(folder / "code.png")}}})
+
+
 if "--version" in args:
     print("2.1.329 (Claude Code)" if claude else "codex-cli 0.171.0")
 elif "--help" in args:
@@ -67,6 +119,8 @@ elif args[0] == "sandbox":
         os.execv(command[0], command)
 elif args[0] == "app-server":
     selected_model = model
+    if any("default_permissions" in option for option in args):
+        (directory / "fixture-argv").write_text(json.dumps(args))
     for line in sys.stdin:
         message = json.loads(line)
         if "id" not in message:
@@ -202,6 +256,7 @@ elif args[0] == "app-server":
                     emit({"method": "error", "params": {"willRetry": True, "error": {
                         "message": "rate limit exceeded", "codexErrorInfo": "rateLimitExceeded"}}})
                 edit(prompt)
+                escalations(prompt, params["threadId"])
                 if "code-failed-429" in prompt.splitlines():
                     emit({"method": "turn/completed", "params": {"turn": {"status": "failed",
                           "error": {"message": "HTTP 429 Too Many Requests"}}}})

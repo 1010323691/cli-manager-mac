@@ -378,7 +378,11 @@ def check_path_aliases(work: Path, tracked):
             directory = path
 
 
-def snapshot(repo: Path, work: Path, parent: str | None, *, include=(), force_all=False):
+def snapshot(repo: Path, work: Path, parent: str | None, *, include=(), force_all=False, exclude=()):
+    # `exclude` names read-only links to the original project's ignored content: never controlled.
+    # A Git workspace lists them in the private repository's info/exclude (see register_mounts);
+    # a plain-project snapshot forces every file in, so there they are excluded by pathspec.
+    skipped = [":(exclude,literal)" + name for name in exclude] if force_all else []
     with tempfile.TemporaryDirectory(dir=repo.parent) as temp:
         env = {"GIT_DIR": str(repo), "GIT_WORK_TREE": str(work),
                "GIT_INDEX_FILE": str(Path(temp) / "index")}
@@ -387,9 +391,9 @@ def snapshot(repo: Path, work: Path, parent: str | None, *, include=(), force_al
             check_path_aliases(work, names(git(work, "ls-files", "-z", extra=env)))
         if force_all:
             # A non-Git project may contain a .gitignore. Copy its files as-is.
-            git(work, "add", "-A", "--force", "--", ".", *COPY_EXCLUDES, extra=env)
+            git(work, "add", "-A", "--force", "--", ".", *COPY_EXCLUDES, *skipped, extra=env)
         else:
-            git(work, "add", "-A", "--", ".", extra=env)
+            git(work, "add", "-A", "--", ".", *skipped, extra=env)
             if include:
                 git(work, "add", "--force", "--", *(":(literal)" + name for name in include), extra=env)
         tree = text(work, "write-tree", extra=env)
@@ -401,6 +405,134 @@ def snapshot(repo: Path, work: Path, parent: str | None, *, include=(), force_al
     commit = text(repo, *args)
     validate_tree(repo, commit)
     return commit
+
+
+MOUNT_LIMIT = 20000
+# Never linked into a workspace, even when the project ignores them.
+UNMOUNTABLE = {".git", ".claude", ".codex", ".agents", ".ssh", ".aws", ".kube", ".cli-delegate-v2",
+               ".mcp.json", ".credentials.json", "auth.json", ".netrc", ".npmrc", ".env", ".gnupg"}
+UNMOUNTABLE_GLOBS = (".env.*", "*.pem", "*.key", "*.p12", "*.pfx", ".cli-manager-apply-*")
+
+
+def mountable(relative: str) -> bool:
+    for part in PurePosixPath(relative).parts:
+        name = part.casefold()
+        if name in UNMOUNTABLE or any(fnmatch.fnmatchcase(name, pattern) for pattern in UNMOUNTABLE_GLOBS):
+            return False
+    return True
+
+
+def ignored_content(root: Path, is_git: bool):
+    """Paths of the original project that never enter a snapshot: ignored files and dependency folders."""
+    if is_git:
+        listed = names(git(root, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"))
+        pending, found = [name.rstrip("/") for name in listed], []
+        # Git reports the topmost directory holding only ignored content. Link the path an ignore
+        # rule actually names, so the worker can still add its own files beside it.
+        for _ in range(12):
+            if not pending:
+                break
+            matched = set(names(git(root, "check-ignore", "-z", "--stdin", required=False,
+                                    inp=b"\0".join(os.fsencode(name) for name in pending) + b"\0") or b""))
+            deeper = []
+            for name in pending:
+                path = root / name
+                if name in matched or path.is_symlink() or not path.is_dir():
+                    found.append(name)
+                else:
+                    deeper.extend(f"{name}/{child}" for child in sorted(os.listdir(path)))
+            pending = deeper[:MOUNT_LIMIT * 4]
+        return list(dict.fromkeys(found))
+    found = []
+    for base, dirs, _ in os.walk(root):
+        for name in list(dirs):
+            if protected(PurePosixPath(name)):
+                dirs.remove(name)
+                found.append((Path(base) / name).relative_to(root).as_posix())
+    return found
+
+
+def clone(source: Path, destination: Path) -> bool:
+    """Copy-on-write clone (APFS): instant, shares storage, and private to the workspace."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.clonefile(os.fsencode(source), os.fsencode(destination), ctypes.c_int(1)) == 0  # CLONE_NOFOLLOW
+    except (OSError, AttributeError):
+        return False
+
+
+def mount_ignored(task: dict, work: Path, existing=(), *, cloning=True):
+    """Bring the original project's ignored content into the workspace without copying it.
+
+    Same-volume content is cloned copy-on-write: the worker reads the originals and may write
+    beside or over them (runner output, tool caches) without touching the original project.
+    Where cloning is unavailable the path becomes a link to the original, which the sandbox
+    grants read-only. Returns the links: they are excluded from snapshots, checkpoints, patches
+    and application. Clones sit at ignored paths, which a snapshot never includes.
+    """
+    baseline = task["baseline"]
+    root = Path(baseline["root"])
+    mounts = [name for name in existing if (work / name).is_symlink()]
+    if not root.is_dir():
+        return mounts
+    # Shallow paths first, so a dependency folder is never crowded out by thousands of files.
+    for relative in sorted(ignored_content(root, baseline["git"]), key=lambda name: (name.count("/"), name)):
+        if len(mounts) >= MOUNT_LIMIT:
+            break
+        source, link = root / relative, work / relative
+        if (not relative or not mountable(relative) or relative in mounts or not os.path.lexists(source)
+                or any(relative.startswith(mount + "/") for mount in mounts)):
+            continue
+        parent = work
+        for part in PurePosixPath(relative).parts[:-1]:
+            parent = parent / part
+            if parent.is_symlink() or (os.path.lexists(parent) and not parent.is_dir()):
+                parent = None
+                break
+        if parent is None or os.path.lexists(link):
+            continue
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if cloning and not source.is_symlink() and clone(source, link):
+            continue
+        link.symlink_to(source, target_is_directory=source.is_dir())
+        mounts.append(relative)
+    return mounts
+
+
+def register_mounts(repo: Path, mounts):
+    """Keep the links out of every snapshot of a Git workspace, whatever the project's rules say.
+
+    A rule such as `views/` matches a directory but not a link of the same name.
+    """
+    def pattern(name):
+        escaped = "".join("\\" + char if char in "\\*?[" else char for char in name)
+        return "/" + (escaped[:-1] + "\\ " if escaped.endswith(" ") else escaped)
+
+    write(repo / "info" / "exclude", ("\n".join(pattern(name) for name in mounts) + "\n").encode())
+
+
+def uncontrolled(repo: Path, work: Path, paths):
+    """Of `paths`, those the project's own ignore rules exclude."""
+    if not paths:
+        return set()
+    env = {"GIT_DIR": str(repo), "GIT_WORK_TREE": str(work)}
+    listed = git(work, "check-ignore", "--no-index", "-z", "--stdin", extra=env, required=False,
+                 inp=b"\0".join(os.fsencode(path) for path in paths) + b"\0")
+    return set(names(listed or b""))
+
+
+def drift(repo: Path, work: Path, attempt: dict, *, force_all: bool):
+    """Controlled paths that differ from the attempt's checkpoint; ignored artefacts do not count."""
+    current = snapshot(repo, work, attempt["base"], force_all=force_all, exclude=attempt.get("mounts") or ())
+    if text(repo, "rev-parse", current + "^{tree}") == attempt["checkpoint_tree"]:
+        return []
+    changed = names(git(repo, "diff", "--no-renames", "--name-only", "-z", attempt["checkpoint_tree"],
+                        current + "^{tree}"))
+    # A Git snapshot already leaves ignored files out. A plain-project snapshot keeps them, so
+    # there the project's own ignore rules decide what the planning session may add between runs.
+    return sorted(set(changed) - (uncontrolled(repo, work, changed) if force_all else set()))
 
 
 def copy_non_git(source: Path, dest: Path):

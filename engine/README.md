@@ -12,7 +12,7 @@ python3 "$R" --help
 | 事项 | 参考文档 |
 |---|---|
 | 安装、账户、实例状态和本地数据 | [实例管理](references/instances.md) |
-| 提交任务、查额度、并发、监控和审批 | [任务与额度调度](references/scheduling.md) |
+| 提交任务、能力档位与安全底线、查额度、并发、监控和审批 | [任务与额度调度](references/scheduling.md) |
 | 等待额度、原会话续跑、重试和跨实例交接 | [续跑与交接](references/handoff.md) |
 | 工作树、报告、验证、应用和清理 | [审核与应用](references/review-and-apply.md) |
 | 单张、批量、参考图、导出和总览图 | [生图](references/images.md) |

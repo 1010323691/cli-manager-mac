@@ -6,23 +6,14 @@
 
 请在实际要使用应用的 Mac 上安装。需要 macOS 14 或更新版本、含 macOS 26 SDK 的 Xcode、Git 和 Python 3.11+。运行实例还需要对应提供方的 CLI。应用在 macOS 26+ 使用 Liquid Glass，较早系统使用原生半透明材质。
 
-### 1. 取得源码与固定版本的引擎
-
-macOS 项目的公开源代码在 `1010323691/cli-manager-mac`。打包和 Python 集成测试还需要原 CLI Manager 的完整源码，当前位于私有的 `1010323691/MySkills` 仓库。请使用已有的 GitHub 访问权限。缺少权限时，报告缺少哪一个 checkout，由用户提供访问权限或固定版本的本地路径。
-
-如果 Mac 已有两个 checkout，进入 macOS 项目的根目录并将 `CLI_MANAGER_LEGACY_SOURCE` 指向旧仓库里的 `cli-manager/` 子目录。打包脚本核对该目录的相关版本，并从 Git 的固定提交取文件。需要固定的提交可从 [engine-revision](resources/engine-revision) 读取。已有的 CLI 源码也可以放在本项目旁边，目录名用 `cli-manager`。
-
-首次使用可在一个新的目录中克隆两份源码。以下命令应在有权读取两个仓库时运行：
+### 1. 取得源码
 
 ~~~sh
 git clone https://github.com/1010323691/cli-manager-mac.git
-git clone --no-checkout https://github.com/1010323691/MySkills.git cli-manager-engine
 cd cli-manager-mac
-engine_checkout="$(cd ../cli-manager-engine && pwd -P)"
-engine_revision="$(cat resources/engine-revision)"
-git -C "$engine_checkout" checkout --detach "$engine_revision"
-export CLI_MANAGER_LEGACY_SOURCE="$engine_checkout/cli-manager"
 ~~~
+
+CLI Manager 引擎（完整 Skill：`SKILL.md`、CLI 脚本、提供方适配和参考资料）在本仓库的 [engine/](engine/) 目录，打包、安装和 Python 集成测试默认使用它。引擎最初从 `1010323691/MySkills` 的提交 `8bc75540d8fd742a3fe48766afba7d676f6d37b3` 导入，[engine-revision](resources/engine-revision) 记录这个来源。需要用外部 checkout 打包时，把 `CLI_MANAGER_LEGACY_SOURCE` 指向它的 `cli-manager/` 目录，脚本会核对该目录与 `engine-revision` 一致并从这个固定提交取文件。
 
 ### 2. 安装应用、完整 Skill 和桌面配套 Skill
 
@@ -86,7 +77,7 @@ open ".build/CLI Manager.app"
 - 每八秒读取本地状态并检查是否有新的调用事件、已到点的重置或待查询的账户。不满 100% 的窗口保存提供方报告的重置时间。额度查询未返回新读数时，重置重试逐步退避。一次轮询间隔内已经结束的短调用会合并为退出后的查询。读取本地状态只加载本机快照。
 - 侧栏选择决定主窗口显示哪个实例的终端。顶边摘要显示有活动的托管任务。为任务选路时，智能体仍通过 `task submit --instance <实例>` 指定用户授权的实例。提供方查询不能区分主动外部退出与认证过期时，曾绑定账户的实例显示「登录失效」。
 - 登录和切换在 Terminal.app 中进行，由提供方的真实 CLI 打开授权流程。应用只从临时回执读取退出码。账户代次改变后，之前绑定到旧代次的任务需重新指定。运行中的实例及仍被任务或账户引用的实例按 CLI 的规则保护。
-- 默认使用当前 CLI 的 `~/.cli-delegate-v2`。可用 `CLI_MANAGER_STATE` 指定隔离目录，或用 `CLI_MANAGER_PYTHON` 指定 Python 的绝对路径。默认搜索 `~/.local/bin`、Homebrew 和系统 PATH。应用源码在 `Sources/`，Python 适配层在 `bridge/`。打包时复制指定 CLI 源码中的运行时和参考文档，应用和桌面配套 Skill 使用同一个包内 CLI。打包固定引擎源于 Git 提交 `8bc75540d8fd742a3fe48766afba7d676f6d37b3`，定义见 `resources/engine-revision`。包内引擎检查现有状态库的结构和版本，遇到不匹配时停止账户、任务和实例写入。升级引擎后需要更新锁定版本、核对状态库契约并重新打包。
+- 默认使用当前 CLI 的 `~/.cli-delegate-v2`。可用 `CLI_MANAGER_STATE` 指定隔离目录，或用 `CLI_MANAGER_PYTHON` 指定 Python 的绝对路径。默认搜索 `~/.local/bin`、Homebrew 和系统 PATH。应用源码在 `Sources/`，Python 适配层在 `bridge/`。引擎源码在 `engine/`。打包时复制其中的运行时和参考文档，应用和桌面配套 Skill 使用同一个包内 CLI。包内引擎检查现有状态库的结构和版本，遇到不匹配时停止账户、任务和实例写入。修改引擎后需要核对状态库契约并重新打包。Codex 任务默认运行在开放档，档位、审批和安全底线见 [任务与额度调度](engine/references/scheduling.md#能力档位)。
 
 ## 委托任务的决策归属
 

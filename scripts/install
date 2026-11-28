@@ -57,11 +57,16 @@ for candidate in "${candidates[@]}"; do
         bundle="$(CLI_MANAGER_APP_OUTPUT="$staged/CLI Manager.app" CLI_MANAGER_BUNDLE_ID= "$project/scripts/build-app")"
         arguments=("$bundle" "$project/skill/cli-manager-desktop" "$apps" "$skills")
         if (( full_skill )); then
-            legacy="${CLI_MANAGER_LEGACY_SOURCE:-$(dirname "$project")/cli-manager}"
+            legacy="${CLI_MANAGER_LEGACY_SOURCE:-$project/engine}"
             IFS= read -r revision < "$project/resources/engine-revision"
             mkdir "$staged/cli-manager"
-            /usr/bin/git -C "$legacy" archive "$revision" -- . |
-                /usr/bin/tar -xf - -C "$staged/cli-manager"
+            if [[ -n "${CLI_MANAGER_LEGACY_SOURCE:-}" ]]; then
+                /usr/bin/git -C "$legacy" archive "$revision" -- . |
+                    /usr/bin/tar -xf - -C "$staged/cli-manager"
+            else
+                /usr/bin/tar -cf - -C "$legacy" --exclude __pycache__ --exclude .DS_Store . |
+                    /usr/bin/tar -xf - -C "$staged/cli-manager"
+            fi
             if [[ ! -f "$staged/cli-manager/SKILL.md" || ! -f "$staged/cli-manager/scripts/delegate.py" ]]; then
                 printf '%s\n' "Pinned CLI Manager checkout does not contain the complete skill." >&2
                 exit 1

@@ -16,6 +16,7 @@ import threading
 import time
 from pathlib import Path
 
+from . import access
 from .store import DelegateError, write_json
 
 SKILL = Path(__file__).resolve().parents[2]
@@ -31,10 +32,30 @@ WORKER_RULES = (
     "read credentials, or attempt a denied operation. Run only checks needed for the task. "
     "Return the requested structured report. Identify unfinished work and tests you actually ran."
 )
+OPEN_RULES = (
+    "You work in an isolated task workspace; the controller handles credentials, Git metadata, review "
+    "and application. Commands run in a sandbox that can write the workspace and the granted write "
+    "directories, read the granted read-only directories, and use the network as configured below. "
+    "When a step needs more (a headless browser, a local server the sandbox blocks, a package install, "
+    "a path outside the grants), request escalated permissions for that exact command with a short "
+    "justification: the planning session reviews each request. Desktop applications and headless "
+    "browsers (Edge, Chrome, Playwright, Puppeteer) cannot start inside the sandbox and crash "
+    "visibly on the user's screen when tried: request escalation for such a command before its "
+    "first run instead of trying it sandboxed. Do not retry a request that was "
+    "denied, do not rephrase it to get around the denial, and report what you could not do. Never "
+    "read or write credentials (SSH keys, keychains, CLI auth files, other instances' directories, "
+    "the manager state). Pushing, publishing, sending external messages and deleting files outside "
+    "the workspace always need an explicit approval. Ignored content of the original project "
+    "(source images, textures, node_modules) is already present in the workspace as copy-on-write "
+    "clones or read-only links; it never becomes part of your result, so do not move it into "
+    "tracked paths. Run only checks the "
+    "task needs. Return the requested structured report, listing unfinished work and the tests you ran."
+)
 CODEX_AUTH = 'cli_auth_credentials_store="file"'
 IMAGE_FORMATS = {".png", ".jpg", ".jpeg", ".webp"}
 # Bumped when the meaning of probe status changes (2: Codex account keys include the workspace).
-PROBE_SCHEMA = 2
+# 3: Codex status lists the capability tiers the CLI supports.
+PROBE_SCHEMA = 3
 
 
 def read_jsonl(path: Path):
@@ -152,6 +173,22 @@ def environment(store, instance, attempt=None):
                GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_OPTIONAL_LOCKS="0",
                CLI_DELEGATE_DEPTH="1")
     env["CLAUDE_CONFIG_DIR" if instance["provider"] == "claude" else "CODEX_HOME"] = str(config)
+    return env
+
+
+def worker_environment(store, instance, task, attempt):
+    """Environment of one attempt's CLI and of the commands it runs.
+
+    Open-tier Codex workers get the user's real HOME: desktop software such as a headless browser
+    needs the login keychain and `~/Library`, and aborts or prompts under an empty home. The CLI's
+    own login stays in the instance's CODEX_HOME, Git still ignores the user's global config, and
+    caches still go to the instance.
+    """
+    env = environment(store, instance, attempt)
+    if instance["provider"] == "codex" and task["kind"] != "image" and access.is_open(access.of(task)):
+        cache = store.instance_dir(instance["id"]) / "cache"
+        env.update(HOME=str(access.home()), npm_config_cache=str(cache / "npm"),
+                   PIP_CACHE_DIR=str(cache / "pip"), UV_CACHE_DIR=str(cache / "uv"))
     return env
 
 
@@ -292,7 +329,38 @@ def probe(store, instance, *, query_quota=True):
         features = invoke(instance, ["features", "list"], env, base)
         status["image"] = bool(re.search(r"^image_generation\s+\S+(?:\s+\S+)*\s+true\s*$",
                                          features.stdout, re.M))
+        status["capabilities"] = codex_capabilities(version, features.stdout)
     return status
+
+
+def codex_capabilities(version, features):
+    """What this CLI can enforce natively; anything missing is refused at submission, never downgraded."""
+    known = {match[1]: match[2] != "removed" for match in
+             re.finditer(r"^(\S+)\s+(.*?)\s+(?:true|false)\s*$", features, re.M)}
+    supported = bool(re.search(r"\b0\.171\.\d+\b", version))
+    # Fixture and older listings may omit a row; only an explicit "removed" withdraws a feature.
+    proxy = supported and known.get("network_proxy", True)
+    image = supported and known.get("image_generation", True)
+    available = {"access.sandbox": supported, "access.open": supported, "access.full": supported,
+                 "network.on": supported, "network.off": supported, "network.loopback": proxy,
+                 "network.allow_domain": proxy, "image": image, "approvals": supported,
+                 "read_dirs": supported, "write_dirs": supported}
+    return {"supported": sorted(key for key, value in available.items() if value),
+            "missing": sorted(key for key, value in available.items() if not value)}
+
+
+def required_capabilities(capabilities):
+    needs = ["access." + capabilities["access"], "network." + capabilities["network"]]
+    if capabilities.get("allow_domains"):
+        needs.append("network.allow_domain")
+    if capabilities.get("image"):
+        needs.append("image")
+    if access.is_open(capabilities):
+        needs.append("approvals")
+    for key in ("read_dirs", "write_dirs"):
+        if capabilities.get(key):
+            needs.append(key)
+    return needs
 
 
 def claude_quota(instance, env, cwd):
@@ -345,18 +413,67 @@ def claude_reset(raw):
         return None
 
 
-def codex_profile(work, repo, tmp, readonly):
+def codex_profile(work, repo, tmp, readonly, grants=None):
+    """Named permission profile. Without `grants` this is the closed sandbox, byte for byte."""
     entries = {":minimal": "read", str(work): "read" if readonly else "write", str(tmp): "write"}
     if repo:
         entries[str(repo)] = "read"
     entries[str(work / ".git")] = "read"
+    isolation = ["-c", "mcp_servers={}", "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
+                 "-c", "features.apps=false", "-c", "features.plugins=false", "-c", "features.hooks=false"]
+    if not grants:
+        fields = ",".join(f"{json.dumps(key)}={json.dumps(value)}" for key, value in entries.items())
+        return ["-c", 'default_permissions="delegate"',
+                "-c", "permissions.delegate.filesystem={" + fields + "}",
+                "-c", "permissions.delegate.network.enabled=false", *isolation, "-c", 'web_search="disabled"']
+    capabilities = grants["capabilities"]
+    for path in grants["read"]:
+        entries.setdefault(path, "read")
+    for path in grants["write"]:
+        entries[path] = "read" if readonly else "write"
+    # Deny wins over the grants above: credentials stay unreachable inside the sandbox in every tier.
+    for path in grants["deny"]:
+        if path not in entries:
+            entries[path] = "deny"
     fields = ",".join(f"{json.dumps(key)}={json.dumps(value)}" for key, value in entries.items())
-    return ["-c", 'default_permissions="delegate"',
-            "-c", "permissions.delegate.filesystem={" + fields + "}",
-            "-c", "permissions.delegate.network.enabled=false",
-            "-c", "mcp_servers={}", "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
-            "-c", "features.apps=false", "-c", "features.plugins=false", "-c", "features.hooks=false",
-            "-c", 'web_search="disabled"']
+    network, domains = capabilities["network"], capabilities.get("allow_domains") or []
+    options = ["-c", 'default_permissions="delegate"',
+               "-c", "permissions.delegate.filesystem={" + fields + "}",
+               "-c", f"permissions.delegate.network.enabled={'false' if network == 'off' else 'true'}"]
+    if network == "loopback" or domains:
+        # The managed proxy enforces the allowlist; local binding keeps 127.0.0.1 servers usable.
+        allowed = ",".join(f'{json.dumps(domain)}="allow"' for domain in domains)
+        options += ["-c", "features.network_proxy=true",
+                    "-c", "permissions.delegate.network.allow_local_binding=true",
+                    "-c", "permissions.delegate.network.domains={" + allowed + "}"]
+    search = "live" if network == "on" and not domains else "disabled"
+    return [*options, *isolation, "-c", f'web_search="{search}"',
+            "-c", f"features.image_generation={'true' if capabilities.get('image') else 'false'}"]
+
+
+def codex_grants(store, instance, task, attempt, capabilities):
+    """Resolved directories for one attempt, or None for the closed sandbox."""
+    if not access.is_open(capabilities):
+        return None
+    base = store.instance_dir(instance["id"])
+    home, cache = base / "home", base / "cache"
+    # Links (the cross-volume fallback for ignored content) point into the original project.
+    read = access.read_roots(store, task, capabilities, own=base, project=bool(attempt.get("mounts")))
+    images = base / "cli" / "generated_images"
+    images.mkdir(mode=0o700, parents=True, exist_ok=True)
+    skills = base / "cli" / "skills"  # Codex's bundled skill instructions (e.g. image generation)
+    if skills.is_dir():
+        read.append(str(skills))
+    read.append(str(images))
+    write = [str(home), str(cache), *(capabilities.get("write_dirs") or [])]
+    # No deny entries: Codex 0.171 keeps an escalated command inside the filesystem sandbox whenever
+    # the profile denies a path, and a sandboxed desktop application (a headless browser) cannot
+    # register with the window server. Credentials stay unreadable in the sandbox because no granted
+    # directory contains one (access.read_roots, access.directories); for approved, unsandboxed
+    # commands the gate screens the command line and the planning session reviews the request.
+    deny = []
+    return {"capabilities": capabilities, "read": read, "write": write, "deny": deny, "images": str(images)}
+
 
 
 def validate_platform(instance, env, directory, options, work, readonly):
@@ -423,7 +540,12 @@ def approval_wait(store, task, attempt, directory, display, cancel):
         if decision_file.is_file():
             return json.loads(decision_file.read_text())
         cancel.wait(.25)
-    return {"behavior": "deny", "message": "请求已过期或任务已停止"}
+    expired = {"behavior": "deny", "by": "timeout", "message": "请求已过期或任务已停止"}
+    if display.get("provider") == "codex" and not cancel.is_set() and not decision_file.exists():
+        # An expired request is a denial the session must not retry. A request cut short because
+        # the task stopped was never judged: a resumed session may ask again.
+        write_json(decision_file, expired)
+    return expired
 
 
 class StoreConnection:
@@ -443,6 +565,8 @@ class StoreConnection:
 def collect_claude(store, instance, task, attempt, directory, env, prompt, cancel, session):
     readonly = task["kind"] == "review"
     validate_platform(instance, env, directory, [], Path(attempt["work"]), readonly)
+    # The open tier is a Codex capability; Claude workers keep their closed sandbox.
+    record_capabilities(store, task, attempt, {**access.SANDBOX, "image": False}, None)
     config_path = directory / "claude-settings.json"
     write_json(config_path, claude_settings(store, task, attempt, readonly))
     bridge = SKILL / "backends/claude/approval_mcp.py"
@@ -500,6 +624,127 @@ def run_process(args, cwd, env, directory, prompt, cancel, *, log="events.jsonl"
             if child.poll() is None:
                 child.kill()
                 child.wait()
+
+
+def fingerprint(kind, *parts):
+    return hashlib.sha256(json.dumps([kind, *parts], sort_keys=True, default=str).encode()).hexdigest()
+
+
+class CodexGate:
+    """Routes a Codex worker's escalation requests: floor first, then the planning session.
+
+    Credential access is refused outright. Irreversible actions always reach the planning session
+    and can never be accepted for the whole session. In `full`, everything else is accepted
+    without asking; in `open`, it waits for `task decide`.
+    """
+    METHODS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+               "item/permissions/requestApproval")
+
+    def __init__(self, store, task, attempt, directory, cancel, grants, env):
+        self.store, self.task, self.attempt = store, task, attempt
+        self.directory, self.cancel, self.env = directory, cancel, env
+        self.capabilities = grants["capabilities"]
+        self.secrets = access.credential_roots(store, own=store.instance_dir(attempt["instance"]))
+        self.writable = [attempt["work"], env["TMPDIR"], *grants["write"]]
+        self.items, self.steer = {}, None
+        self.denied = self.previous_denials()
+
+    def previous_denials(self):
+        """Denials of every run of this attempt: a resumed session inherits them."""
+        denied = set()
+        for request_file in self.directory.parent.glob("*/approvals/*.request.json"):
+            decision_file = request_file.with_name(request_file.name.replace(".request.json", ".decision.json"))
+            try:
+                request = json.loads(request_file.read_text())
+                decision = json.loads(decision_file.read_text())
+            except (OSError, ValueError):
+                continue
+            if decision.get("behavior") == "deny" and request.get("fingerprint"):
+                denied.add(request["fingerprint"])
+        return denied
+
+    def event(self, kind, **fields):
+        with StoreConnection(self.store) as state:
+            state.event(self.task["id"], kind, attempt=self.attempt["id"], **fields)
+
+    def remember(self, item):
+        if item.get("id"):
+            self.items[item["id"]] = item
+
+    def describe(self, method, payload):
+        cwd = payload.get("cwd") or self.attempt.get("cwd")
+        if method == "item/commandExecution/requestApproval":
+            command = payload.get("command") or ""
+            floor, paths = access.classify_command(command, cwd, secrets=self.secrets, writable=self.writable,
+                                                   env_home=self.env.get("HOME"))
+            network = payload.get("networkApprovalContext")
+            extra = payload.get("additionalPermissions")
+            extra_paths = access.permission_paths(extra)
+            if any(access.grants_secret(path, self.secrets) for path in extra_paths):
+                floor = "credential"
+            targets = [f"{network.get('protocol')}://{network.get('host')}"] if network else []
+            return ("command", "Command", {"command": command, "cwd": cwd, "reason": payload.get("reason"),
+                                           "paths": [*paths, *extra_paths], "network": targets,
+                                           "additional_permissions": extra}, floor, (command, cwd, targets))
+        if method == "item/fileChange/requestApproval":
+            item = self.items.get(payload.get("itemId")) or {}
+            changes = [{"path": change.get("path"), "kind": (change.get("kind") or {}).get("type"),
+                        "diff": (change.get("diff") or "")[:4000]} for change in item.get("changes") or []]
+            if payload.get("grantRoot"):
+                changes.append({"path": payload["grantRoot"], "kind": "grant_root", "diff": ""})
+            floor, paths = access.classify_changes(changes, secrets=self.secrets, writable=self.writable)
+            if payload.get("grantRoot") and access.grants_secret(payload["grantRoot"], self.secrets):
+                floor = "credential"
+            return ("file_change", "FileChange", {"changes": changes, "cwd": cwd, "reason": payload.get("reason"),
+                                                  "paths": paths, "network": []}, floor,
+                    ([(c["path"], c["kind"], c["diff"]) for c in changes],))
+        permissions = payload.get("permissions") or {}
+        paths = access.permission_paths(permissions)
+        # A directory grant that holds a credential location (the home directory, `/`) is refused too.
+        floor = "credential" if any(access.grants_secret(path, self.secrets) for path in paths) else None
+        network = ["*"] if (permissions.get("network") or {}).get("enabled") else []
+        return ("permissions", "Permissions", {"permissions": permissions, "cwd": cwd,
+                                               "reason": payload.get("reason"), "paths": paths,
+                                               "network": network}, floor, (permissions, cwd))
+
+    def reply(self, method, payload, allowed, always=False):
+        if method == "item/permissions/requestApproval":
+            return {"permissions": (payload.get("permissions") or {}) if allowed else {},
+                    "scope": "session" if allowed and always else "turn"}
+        return {"decision": ("acceptForSession" if always else "accept") if allowed else "decline"}
+
+    def refuse(self, method, payload, what, message):
+        if self.steer and message:
+            try:
+                self.steer(f"[主会话审批] 已拒绝{what}。说明：{message} 不要原样重试这一请求。")
+            except Exception:
+                pass
+        return self.reply(method, payload, False)
+
+    def handle(self, method, payload):
+        kind, tool, display, floor, identity = self.describe(method, payload)
+        mark = fingerprint(kind, *identity)
+        audit = {"request_kind": kind, "floor": floor, "command": display.get("command"),
+                 "cwd": display.get("cwd"), "paths": display.get("paths"), "network": display.get("network")}
+        if floor == "credential":
+            self.denied.add(mark)
+            self.event("approval_denied_by_floor", **audit)
+            return self.refuse(method, payload, "凭据访问", "安全底线禁止读写凭据路径。")
+        if mark in self.denied:
+            self.event("approval_repeat_denied", **audit)
+            return self.refuse(method, payload, "重复请求", "同一请求在本会话已被拒绝。")
+        if self.capabilities["access"] == "full" and floor is None:
+            self.event("approval_auto_allowed", **audit)
+            return self.reply(method, payload, True)
+        request = {"provider": "codex", "kind": kind, "tool_name": tool, "input": display, "floor": floor,
+                   "session_allow": floor is None, "fingerprint": mark,
+                   "access": self.capabilities["access"]}
+        decision = approval_wait(self.store, self.task, self.attempt, self.directory, request, self.cancel)
+        if decision.get("behavior") == "allow":
+            return self.reply(method, payload, True, bool(decision.get("always")) and floor is None)
+        self.denied.add(mark)
+        return self.refuse(method, payload, {"command": "命令", "file_change": "文件修改"}.get(kind, "额外权限"),
+                           decision.get("message") or "主会话拒绝此请求")
 
 
 def merge_codex_quota_update(previous, payload):
@@ -579,8 +824,13 @@ def collect_codex(store, instance, task, attempt, directory, env, prompt, cancel
     readonly = image_task or task["kind"] == "review"
     work = Path(attempt["work"])
     repo = Path(attempt["repo"]) if not image_task and task["baseline"]["git"] else None
-    profile = codex_profile(work, repo, Path(env["TMPDIR"]), readonly)
+    capabilities = access.of(task)
+    # Image tasks keep their own closed, read-only directory: generation happens on the service.
+    grants = None if image_task else codex_grants(store, instance, task, attempt, capabilities)
+    profile = codex_profile(work, repo, Path(env["TMPDIR"]), readonly, grants)
     validate_platform(instance, env, directory, profile, work, readonly)
+    gate = CodexGate(store, task, attempt, directory, cancel, grants, env) if grants else None
+    record_capabilities(store, task, attempt, capabilities, grants)
     image_items = []
     events, completed = {}, threading.Event()
 
@@ -589,9 +839,11 @@ def collect_codex(store, instance, task, attempt, directory, env, prompt, cancel
                 "userMessage", "agentMessage", "reasoning", "plan", "contextCompaction",
                 "enteredReviewMode", "exitedReviewMode"):
             events["tool"] = True
+        if gate and method in ("item/started", "item/completed"):
+            gate.remember(payload.get("item") or {})
         if method == "item/completed":
             item = payload.get("item") or {}
-            if image_task and item.get("type") == "imageGeneration":
+            if (image_task or gate) and item.get("type") == "imageGeneration":
                 image_items.append({key: item.get(key) for key in ("status", "failure", "savedPath")})
             if item.get("type") == "agentMessage" and item.get("text"):
                 events["text"] = item["text"]
@@ -629,6 +881,8 @@ def collect_codex(store, instance, task, attempt, directory, env, prompt, cancel
                 for q in questions
                 if (value := answers.get(q["id"], answers.get(q.get("question")))) is not None
             }}
+        if gate and method in CodexGate.METHODS:
+            return gate.handle(method, payload)
         if method in ("item/permissions/requestApproval", "item/commandExecution/requestApproval",
                       "item/fileChange/requestApproval", "mcpServer/elicitation/request"):
             with StoreConnection(store) as state:
@@ -648,7 +902,7 @@ def collect_codex(store, instance, task, attempt, directory, env, prompt, cancel
         # The startup probe ran on another server; the CLI may have switched workspace since.
         check_codex_account(store, instance, app, attempt["account"], attempt["generation"])
         thread_options = {"cwd": attempt["cwd"], "approvalPolicy": "on-request", "approvalsReviewer": "user",
-                          "developerInstructions": WORKER_RULES}
+                          "developerInstructions": worker_rules(capabilities, grants, attempt)}
         if task.get("model"):
             thread_options["model"] = task["model"]
         if session:
@@ -694,6 +948,10 @@ def collect_codex(store, instance, task, attempt, directory, env, prompt, cancel
             options["effort"] = task["effort"]
         try:
             turn = app.request("turn/start", options, timeout=20)["turn"]["id"]
+            if gate:
+                gate.steer = lambda text: app.request(
+                    "turn/steer", {"threadId": native_session, "expectedTurnId": turn,
+                                   "input": [{"type": "text", "text": text}]}, timeout=10)
         except RuntimeError as error:
             # An explicit RPC rejection precedes execution. A timeout is ambiguous.
             message = str(error)
@@ -752,7 +1010,66 @@ def collect_codex(store, instance, task, attempt, directory, env, prompt, cancel
         structured = None
     return {"outcome": state, "structured": structured, "session": native_session, "model": actual,
             "migration_retry": bool(turn.get("status") == "failed" and state != "quota" and not events.get("tool")),
-            "usage": events.get("usage"), "quota": events.get("quota"), "diagnostic": info or error.get("message")}
+            "usage": events.get("usage"), "quota": events.get("quota"), "diagnostic": info or error.get("message"),
+            "generated": generated_images(image_items, env, native_session) if gate else []}
+
+
+def worker_rules(capabilities, grants, attempt):
+    if not grants:
+        return WORKER_RULES
+    network = {"on": "The network is available" + (
+        f", limited to: {', '.join(capabilities['allow_domains'])} and loopback."
+        if capabilities.get("allow_domains") else ", including loopback."),
+        "loopback": "Only loopback (127.0.0.1 / localhost) networking is available.",
+        "off": "The network is disabled."}[capabilities["network"]]
+    real = access.home()
+    lines = [OPEN_RULES, network,
+             f"Workspace (writable): {attempt['work']}",
+             "Extra writable directories: " + (", ".join(capabilities.get("write_dirs") or []) or "none"),
+             "Read-only directories: " + ", ".join(grants["read"]),
+             f"HOME is the user's real home ({real}): skills are at ~/.claude/skills and tool environments "
+             "at ~/.cache, both read-only. Everything else under HOME is outside your grants."]
+    if capabilities.get("image"):
+        lines.append("Image generation is enabled. Generated files land under "
+                     f"{grants['images']}/<thread>; copy the ones you keep into the workspace or "
+                     "an extra writable directory and name them in your report.")
+    return "\n".join(lines)
+
+
+def record_capabilities(store, task, attempt, capabilities, grants):
+    """Audit what this attempt actually runs with."""
+    effective = {**access.summary(capabilities),
+                 "read_roots": grants["read"] if grants else [],
+                 "write_roots": [attempt["work"], *(grants["write"] if grants else [])],
+                 "approvals": ("auto" if capabilities["access"] == "full" else "planner") if grants else "denied"}
+    if task["kind"] == "image":
+        effective.update(access="sandbox", network="off", read_roots=[], image=True,
+                         note="生图任务使用独立只读目录")
+    with store.transaction():
+        row = store.get("attempts", attempt["id"])
+        row["capabilities"] = effective
+        store.put("attempts", row)
+        store.event(task["id"], "capabilities_applied", attempt=attempt["id"], capabilities=effective)
+    attempt["capabilities"] = effective
+
+
+def generated_images(items, env, thread):
+    """Completed built-in image generations of a code task, confined to this thread's folder."""
+    if not thread or not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", thread):
+        return []
+    root = Path(env["CODEX_HOME"]) / "generated_images" / thread
+    found = []
+    for item in items:
+        saved = item.get("savedPath")
+        if item.get("status") != "completed" or item.get("failure") is not None or not saved:
+            continue
+        path = Path(saved)
+        if (path.is_absolute() and path.is_file() and not path.is_symlink()
+                and path.resolve().is_relative_to(root.resolve())
+                and 0 < path.stat().st_size <= 64 * 1024 * 1024 and image_format(path)
+                and str(path) not in found):
+            found.append(str(path))
+    return found
 
 
 def image_format(path: Path):

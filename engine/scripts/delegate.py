@@ -25,6 +25,12 @@ def path(value):
     return Path(value).expanduser().resolve()
 
 
+def absolute(value):
+    if not os.path.isabs(os.path.expanduser(value)):
+        raise argparse.ArgumentTypeError("需要绝对路径")
+    return Path(value).expanduser()
+
+
 def emit(data):
     print(json.dumps(data, ensure_ascii=False, indent=2), flush=True)
 
@@ -62,7 +68,13 @@ def submit(store, a):
     spec = {"id": a.id, "kind": a.kind, "project": a.project, "instances": a.instance, "backend": a.backend,
             "dependencies": list(dict.fromkeys(a.depends_on)), "include": a.include, "verify": a.verify,
             "verify_timeout": a.verify_timeout, "timeout": a.timeout, "approval_timeout": a.approval_timeout,
-            "model": a.model, "effort": a.effort, "handoff_targets": a.handoff_to, "parallel": a.parallel}
+            "model": a.model, "effort": a.effort, "handoff_targets": a.handoff_to, "parallel": a.parallel,
+            # Unset options resolve to the open defaults; only `--access sandbox` closes the task.
+            "capabilities": {"access": a.access, "network": a.network, "allow_domains": a.allow_domain,
+                             "read_dirs": [str(item) for item in a.read_dir],
+                             "write_dirs": [str(item) for item in a.write_dir],
+                             "image": {"on": True, "off": False, None: None}[a.image],
+                             "confirm_full": a.confirm_full}}
     if a.batch_dir:
         if a.kind != "image":
             raise DelegateError("提示词目录批量提交仅用于 image")
@@ -168,6 +180,15 @@ def parse(argv=None):
     add.add_argument("--parallel", type=positive)
     add.add_argument("--timeout", type=positive, default=3600)
     add.add_argument("--approval-timeout", type=positive, default=1800)
+    add.add_argument("--access", choices=("open", "sandbox", "full"),
+                     help="open（默认）：可联网、可读授权目录，越界请求送主会话审批；"
+                          "sandbox：封闭沙箱；full：越界不逐条审批，需 --confirm-full 并在终端确认")
+    add.add_argument("--network", choices=("on", "loopback", "off"), help="默认 on；sandbox 档强制 off")
+    add.add_argument("--allow-domain", action="append", default=[], help="把外网收窄为域名白名单，可重复")
+    add.add_argument("--read-dir", type=absolute, action="append", default=[], help="追加只读目录（绝对路径），可重复")
+    add.add_argument("--write-dir", type=absolute, action="append", default=[], help="追加可写目录（绝对路径），可重复")
+    add.add_argument("--image", choices=("on", "off"), help="Codex 自带生图，默认 on；sandbox 档关闭")
+    add.add_argument("--confirm-full", action="store_true")
     add.add_argument("--verify")
     add.add_argument("--verify-timeout", type=positive, default=900)
     tasks.add_parser("list")
@@ -180,6 +201,8 @@ def parse(argv=None):
     d.add_argument("action", choices=("allow", "deny", "answer"))
     d.add_argument("--answers", type=json.loads, default={})
     d.add_argument("--message")
+    d.add_argument("--always", action="store_true",
+                   help="allow 时本会话同类请求放行（acceptForSession）；不可逆操作不适用")
     add_id(tasks, "cancel")
     for operation in ("retry", "resume"):
         add_id(tasks, operation).add_argument("--note")
@@ -191,6 +214,9 @@ def parse(argv=None):
     hs.add_argument("--to", required=True, type=identifier)
     hs.add_argument("--brief", required=True, type=path)
     hs.add_argument("--authorize-target", action="store_true")
+    hs.add_argument("--authorize-access", action="store_true",
+                    help="目标换了账户时，重新授权任务的能力档位")
+    hs.add_argument("--confirm-full", action="store_true")
     hs.add_argument("--model")
     hs.add_argument("--effort")
 
@@ -249,7 +275,7 @@ def run(store, a):
                 for row in instance_status(store, a.id)]
     if group == "ledger":
         keys = ("id", "task", "instance", "state", "model", "start", "end", "usage", "cost_usd",
-                "quota_before", "quota_after", "report")
+                "quota_before", "quota_after", "report", "capabilities", "artifacts")
         return [{key: attempt.get(key) for key in keys} for attempt in store.rows("attempts")
                 if not a.id or a.id == attempt["task"]]
     if group == "queue":
@@ -268,7 +294,7 @@ def run(store, a):
     if action == "decide":
         if not isinstance(a.answers, dict):
             raise DelegateError("--answers 要求 JSON 对象")
-        return ctl.decide(store, a.id, a.request, a.action, a.answers, a.message)
+        return ctl.decide(store, a.id, a.request, a.action, a.answers, a.message, a.always)
     if action == "cancel":
         ctl.stop_task(store, a.id)
         return task_status(store, a.id)
@@ -277,7 +303,9 @@ def run(store, a):
     if action == "handoff":
         if a.command_2 == "prepare":
             return ctl.prepare_handoff(store, a.id)
-        return ctl.start_handoff(store, a.id, a.to, a.brief.read_text(), a.authorize_target, a.source, a.model, a.effort)
+        return ctl.start_handoff(store, a.id, a.to, a.brief.read_text(), a.authorize_target, a.source,
+                                 a.model, a.effort, authorize_access=a.authorize_access,
+                                 confirm_full=a.confirm_full)
     if action == "review":
         return ctl.review(store, a.id, a.command_2, a.revision, a.note)
     if action == "apply":
